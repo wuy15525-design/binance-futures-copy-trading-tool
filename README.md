@@ -2,7 +2,7 @@
 
 **4.2.5 · Android 13 及以上 · 币安 U 本位 USDT 永续合约**
 
-**[下载 v4.2.5 APK](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/raw/refs/heads/main/downloads/binance-copy-terminal-v4.2.5.apk)** · [查看旧版发布](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases)
+**[下载 v4.2.5 APK](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/download/v4.2.5/binance-copy-terminal-v4.2.5.apk)** · [查看发布页](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/tag/v4.2.5)
 
 在安卓手机上读取币安带单组合的公开成交记录，按你设置的合约白名单和跟单规则，用自己的币安账户执行委托。支持仅监测、模拟盘演练、模拟盘跟随官网信号和实盘跟单。
 
