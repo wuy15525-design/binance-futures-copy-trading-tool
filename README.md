@@ -1,14 +1,22 @@
 # 合约跟单台
 
-**4.2.5 · Android 13 及以上 · 币安 U 本位 USDT 永续合约**
+**4.3.0 · Android 13 及以上 · 币安 U 本位 USDT 永续合约**
 
-**[下载 v4.2.5 APK](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/download/v4.2.5/binance-copy-terminal-v4.2.5.apk)** · [查看发布页](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/tag/v4.2.5)
+**[下载 v4.3.0 APK](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/download/v4.3.0/binance-copy-terminal-v4.3.0.apk)** · [查看发布页](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/tag/v4.3.0)
 
 在安卓手机上读取币安带单组合的公开成交记录，按你设置的合约白名单和跟单规则，用自己的币安账户执行委托。支持仅监测、模拟盘演练、模拟盘跟随官网信号和实盘跟单。
 
 [更新说明](#更新说明) · [快速开始](#快速开始) · [跟单怎么执行](#跟单怎么执行) · [延迟与刷新](#延迟与刷新) · [带单保证金划转](#带单保证金划转) · [网络与后台](#网络与后台) · [暂停与排障](#暂停与排障) · [联系与捐赠](#联系与捐赠)
 
 ## 更新说明
+
+### v4.3.0
+
+- **建档分页卡住时按日期续读。** 保留已读成交，核对交界后继续读取。日期控件晚加载时也可续读。
+- **兼容只显示「做多／做空」的成交。** 先建档，再核对开平方向。白名单内的新成交若方向待核对，暂缓自动委托。
+- **核对历史重复成交。** 结合官网仓位历史归并能确认的重复，并保留跟单进度和账户成交。
+
+完整说明见 [v4.3.0 Release](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/tag/v4.3.0)。
 
 ### v4.2.5
 
