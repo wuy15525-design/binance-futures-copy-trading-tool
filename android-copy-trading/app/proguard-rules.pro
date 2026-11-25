@@ -1,0 +1,5 @@
+-keep,allowoptimization class com.localcopy.terminal.MainActivity { public <init>(); }
+-keep,allowoptimization class com.localcopy.terminal.InfoActivity { public <init>(); }
+-keep,allowoptimization class com.localcopy.terminal.AutoFollowService { public <init>(); }
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile

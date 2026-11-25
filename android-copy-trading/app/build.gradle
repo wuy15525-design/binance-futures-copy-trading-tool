@@ -1,0 +1,35 @@
+plugins {
+    id("com.android.application") version "9.3.3"
+}
+android {
+    namespace "com.localcopy.terminal"
+    compileSdk 37
+    buildToolsVersion "37.0.0"
+    defaultConfig {
+        applicationId "com.localcopy.terminal"
+        minSdk 33
+        targetSdk 37
+        versionCode 40
+        versionName "4.3.9"
+        buildConfigField "String", "RELEASE_CERT_SHA256", '""'
+    }
+    buildFeatures {
+        buildConfig true
+    }
+    buildTypes {
+        debug {
+            applicationIdSuffix ".sandbox"
+        }
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            def cert = providers.gradleProperty('copyReleaseCertSha256').getOrElse(file('release-cert.sha256').text.trim())
+            if (!(cert ==~ /[a-fA-F0-9]{64}/)) throw new GradleException('Invalid release certificate SHA-256')
+            buildConfigField "String", "RELEASE_CERT_SHA256", '"' + cert + '"'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
