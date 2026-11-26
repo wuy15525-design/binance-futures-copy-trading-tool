@@ -1,22 +1,30 @@
 # 合约跟单台
 
-**4.3.20 · Android 13 及以上 · 币安 U 本位 USDT 永续合约**
+**Android 4.3.20 · Windows 4.2.18 x64 测试版 · 币安 U 本位 USDT 永续合约**
 
-**[下载 v4.3.20 APK](releases/binance-copy-terminal-v4.3.20.apk?raw=true)**
+**[下载 Android APK](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/download/v4.3.20/binance-copy-terminal-v4.3.20.apk)** · **[下载 Windows x64 ZIP](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/download/v4.3.20/CopyTerminal-Windows-x64-4.2.18-test.zip)** · [查看发布页](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/tag/v4.3.20)
 
-在安卓手机上读取币安带单组合的公开成交记录，按你设置的合约白名单和跟单规则，用自己的币安账户执行委托。支持仅监测、模拟盘演练、模拟盘跟随官网信号和实盘跟单。
+在 Android 和 Windows 上读取币安带单组合的公开成交记录，按你设置的合约白名单和跟单规则，用自己的币安账户执行委托。支持仅监测、模拟盘演练、模拟盘跟随官网信号和实盘跟单。
 
-[更新说明](#更新说明) · [快速开始](#快速开始) · [跟单怎么执行](#跟单怎么执行) · [延迟与刷新](#延迟与刷新) · [带单保证金划转](#带单保证金划转) · [网络与后台](#网络与后台) · [暂停与排障](#暂停与排障) · [联系与捐赠](#联系与捐赠) · [源码与构建](#源码与构建)
+[Windows 安装](#windows-安装) · [更新说明](#更新说明) · [快速开始](#快速开始) · [跟单怎么执行](#跟单怎么执行) · [延迟与刷新](#延迟与刷新) · [带单保证金划转](#带单保证金划转) · [网络与后台](#网络与后台) · [暂停与排障](#暂停与排障) · [联系与捐赠](#联系与捐赠) · [源码与构建](#源码与构建)
+
+## Windows 安装
+
+下载并完整解压 ZIP，双击 `CopyTerminal/CopyTerminal.exe`。需要 Windows 10 或 11 x64、.NET Framework 4.7.2 或更新版本，以及 Microsoft Edge WebView2 Evergreen Runtime。升级时可解压到新的程序目录，已有档案和设置仍在 `%LOCALAPPDATA%\CopyTerminal`。在「跟单设置」保存组合后，可以先启动无需 API 密钥的「官网监测」。
 
 ## 源码与构建
 
 在 Android Studio 中打开 `android-copy-trading/`。此目录包含 4.3.20 的 Android 应用、资源、构建脚本和离线测试。[Android 工程与构建说明](android-copy-trading/README.md#构建与检查)
 
+Windows 的 WinForms/WebView2 宿主、Java 引擎、界面和离线测试均在 `windows-copy-terminal/`。[Windows 工程与构建说明](windows-copy-terminal/build-tools/README.md)
+
 ## 更新说明
 
-### v4.3.20
+### Android 4.3.20 与 Windows 4.2.18
 
-修复了建档报错问题
+上架PC端软件，功能逻辑与Android端相同。
+
+Android 4.3.20 修复了建档报错问题。
 
 ### v4.3.17
 
@@ -48,7 +56,7 @@
 
 ### 1. 安装并检查通知
 
-点击上方「下载 v4.3.20 APK」获取 `binance-copy-terminal-v4.3.20.apk`。APK 的 SHA-256 为 `8de874ec6f244c05fb999861c4a8eb882e2e230b074a054eb62ced1857ea5c96`。
+点击上方「下载 Android APK」获取 `binance-copy-terminal-v4.3.20.apk`。APK 的 SHA-256 为 `8de874ec6f244c05fb999861c4a8eb882e2e230b074a054eb62ced1857ea5c96`。
 
 从旧版更新时，请使用同一签名的发布包覆盖安装，以保留本机档案和设置。打开应用，在「设置 → 后台与通知 → 测试通知与提示音」允许通知并试听。长时间运行前按[网络与后台](#网络与后台)设置手机。
 

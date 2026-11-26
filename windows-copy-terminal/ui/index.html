@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>合约跟单台</title><link href="style.css" rel="stylesheet"><script defer src="app.js"></script></head>
+<body><div id="shell">
+<aside><div class="brand"><i class="logo">◈</i><div><b>合约跟单台</b><small>WINDOWS EDITION</small></div></div>
+<nav aria-label="主导航"><button data-tab="run" class="current"><i>◫</i><span>运行总览</span></button><button data-tab="history"><i>≣</i><span>成交记录</span></button><button data-tab="settings"><i>⚙</i><span>跟单设置</span></button></nav>
+<div class="asidefoot"><span class="light"></span><span>本机终端</span><small>v4.2.18</small></div></aside>
+<main id="workspace"><header><div><div class="crumb">工作区 <span>/</span> <span id="crumb">运行总览</span></div><h1 id="title">运行总览</h1></div><div class="headright"><button id="donate" class="subtle">♡　捐赠</button><time id="clock"></time></div></header>
+<div id="message" role="status" hidden></div>
+<section id="run" class="view">
+<div class="hero"><div class="heroTitle"><div><span class="eyebrow">跟单组合</span><h2 id="leaderName">等待载入</h2><div id="pid" class="mono"></div></div><span id="runBadge" class="badge">未启动</span></div>
+<div class="metrics"><div><label>本轮总盈亏 <button class="eye" id="mask" title="显示或隐藏金额">◉</button></label><strong id="pnl">****</strong><small>USDT</small></div><div><label>钱包余额</label><strong id="wallet">****</strong><small>USDT</small></div><div><label>跟单时长</label><strong id="duration">00:00:00</strong></div><div><label>带单保证金余额</label><strong id="margin">—</strong><small>USDT</small></div></div></div>
+<div class="control"><div><b id="strategy">运行控制</b><div id="status" class="secondary" aria-live="off"></div></div>
+<div class="buttons"><button id="start" class="primary">启动跟单</button><button id="pause" hidden>暂停开仓</button><button id="factor" hidden>调整系数</button><button id="stop" class="danger" hidden>停止运行</button></div></div>
+<div id="capture" class="note"></div><div id="limited" class="control" hidden><b id="webStatus">官网访问需要处理</b><div><button id="region">查看官网提示</button> <button id="retry">重新读取</button></div></div>
+<div id="initial" class="control" hidden><b>已发现可选择的初始仓位</b><button id="chooseInitial" class="primary">选择已有仓位</button></div>
+<div class="deskgrid"><article id="leaderPanel"></article><article id="minePanel"></article></div>
+<div class="deskgrid"><article id="waitPanel"></article><article id="detectPanel"></article></div><article id="logPanel"></article></section>
+<section id="history" class="view" hidden><div class="bar"><div><h2 id="histName">带单员档案</h2><p id="histId" class="secondary"></p></div><button id="export">↓　导出成交 CSV</button></div>
+<div class="tabs" role="group"><button data-hist="trades" class="selected">带单员成交</button><button data-hist="fills">我的成交</button><button data-hist="transfers">保证金划转</button></div><article id="historyPanel"></article><p class="note" id="balanceStatus"></p></section>
+<section id="settings" class="view" hidden><div class="settingsgrid"><article><div class="articlehead"><h2>跟单规则</h2><span class="tag">U 本位合约</span></div><div class="formbody"><label>带单组合 ID<input id="portfolio" type="text" inputmode="numeric" list="previous" maxlength="25" autocomplete="off"><datalist id="previous"></datalist></label><p class="secondary">从币安带单组合链接的 lead-details/ 后复制数字。保存时会核对官网组合。</p>
+<div class="bar"><h3>合约白名单</h3><button id="addRule">＋ 添加合约</button></div><div id="rules"></div><div class="actions"><button id="saveRules" class="primary">保存跟单规则</button></div></div></article>
+<div class="stack"><article><div class="articlehead"><h2>币安合约账户</h2></div><div class="formbody"><label>账户与权限<select id="realm"><option value="demo">测试网交易</option><option value="readonly">实盘只读</option><option value="live">实盘交易</option></select></label><p id="keyStatus" class="secondary"></p><div class="buttons"><button id="keys">设置 API 密钥</button><button id="query">查询账户</button></div><p class="note">凭证加密保存，仅当前 Windows 用户可解密。</p></div></article>
+<article><div class="articlehead"><h2>后台与通知</h2></div><div class="formbody"><p>关闭窗口会收至系统托盘。运行时保持设备联网，合盖、手动睡眠和关机会中断任务。</p><button id="sound">测试通知和提示音</button></div></article>
+<article><div class="articlehead"><h2>关于</h2></div><div class="formbody buttons"><button id="author">作者信息</button><button id="legal">免责声明</button><button id="exit">退出软件</button></div></article></div></div></section>
+</main></div><dialog id="dialog"><form id="dialogForm"><div class="modalhead"><h2 id="dialogTitle"></h2><button type="button" id="closeDialog" aria-label="关闭">×</button></div><div id="dialogBody"></div><div class="actions" id="dialogActions"></div></form></dialog>
+<div id="splash" hidden><img src="coin.png" alt=""><div>场外跟单，无需求人。</div></div></body></html>
