@@ -32,6 +32,31 @@ public final class TerminalTests {
     private static long now = 1_795_016_431_494L;
 
     public static void main(String[] args) throws Exception {
+        test("新建档合并相同开仓，按可见开仓及后续不同平仓保留相同平仓的有效笔数", () -> {
+            Rules.Signal open = new Rules.Signal(MU, OPEN_SHORT, now, d("100"), d("10"));
+            Rules.Signal fullClose = new Rules.Signal(MU, CLOSE_SHORT, now + 1000, d("95"), d("10"));
+            TradeReview.BaselineCounts full = TradeReview.baselineCounts(List.of(open, open.withOccurrence(1),
+                    fullClose, fullClose.withOccurrence(1)));
+            ok(full.rows.equals(List.of(open, fullClose)));
+            ok(full.settled.size() == 2);
+
+            Rules.Signal part = new Rules.Signal(MU, CLOSE_SHORT, now + 1000, d("95"), d("3"));
+            Rules.Signal remaining = new Rules.Signal(MU, CLOSE_SHORT, now + 2000, d("94"), d("4"));
+            TradeReview.BaselineCounts both = TradeReview.baselineCounts(List.of(open, part, part.withOccurrence(1), remaining));
+            ok(both.rows.size() == 4 && both.settled.get(part.time).size() == 2);
+
+            Rules.Signal eight = new Rules.Signal(MU, CLOSE_SHORT, now + 2000, d("94"), d("7"));
+            TradeReview.BaselineCounts one = TradeReview.baselineCounts(List.of(open, part, part.withOccurrence(1), eight));
+            ok(one.rows.equals(List.of(open, part, eight)));
+            ok(one.settled.get(part.time).size() == 1);
+
+            TradeReview.BaselineCounts unknown = TradeReview.baselineCounts(List.of(part, part.withOccurrence(1)));
+            ok(unknown.rows.size() == 2 && unknown.settled.isEmpty());
+
+            TradeReview.BaselineCounts upgrade = TradeReview.baselineCounts(List.of(open, open.withOccurrence(1),
+                    fullClose, fullClose.withOccurrence(1)), java.util.Set.of(fullClose.time));
+            ok(upgrade.rows.size() == 4 && upgrade.settled.get(fullClose.time).size() == 2);
+        });
         test("中文合约代码可保存，官网成交及平仓历史保留原单位", () -> {
             String symbol = "币安人生USDT";
             String card = "11-18, 23:14:58\n开多\n以价格为0.1 USDT买入开多币安人生USDT永续合约，成交数量为2 币安人生总价值为0.2 USDT。";

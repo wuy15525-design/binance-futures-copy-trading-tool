@@ -18,10 +18,6 @@ import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONException;
 
-/**
- * 把网页可见的成交卡片转成 Signal。每页必须能解析出一致的方向、数量和时间，
- * 字段只渲染了一部分时抛出异常，让 WebView 保留上一份有效列表并等待下一次观测。
- */
 final class WebRecords {
     private static final String NUMBER = "([0-9][0-9,]*(?:\\.[0-9]+)?)";
     private static final Pattern TIME_PATTERN = Pattern.compile(
@@ -36,7 +32,6 @@ final class WebRecords {
     private static final Pattern TURNOVER = Pattern.compile(
             "(?:总价值|总成交额|成交总额|成交金额|成交额)\\s*(?:为|[:：])?\\s*" + NUMBER + "\\s*USDT");
 
-    // 有日期控件时以官网范围推断省略的年份。控件迟到时用有限的近期范围解析，并拒绝有歧义的日期。
     static List<Rules.Signal> parsePage(String text, JSONArray dates, ZoneId zone, LocalDate today)
             throws JSONException {
         if (dates.length() >= 2) {

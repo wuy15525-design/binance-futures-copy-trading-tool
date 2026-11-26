@@ -28,6 +28,8 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -39,11 +41,6 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
-/**
- * 在 WebView 中读取币安组合详情的公开成交、仓位历史与划转记录。
- * 网页只提供当前渲染的内容。脚本报告页面状态和可见数据，由这里判定等待、翻页、续读或失败。
- * 成交从这里交给 AutoFollowService 复核，再由 LeaderArchive 落库并推进档案水位。
- */
 final class WebsiteCapture {
     private static final long DEADLINE = 25000;
     private static final long BALANCE_DEADLINE = 40000;
@@ -59,7 +56,6 @@ final class WebsiteCapture {
     private static final long DATE_APPLY_RETRY = 2200;
     private static final long DATE_APPLY_TIMEOUT = 6500;
     private static final long DATE_CONTROL_TIMEOUT = 8000;
-    // 官网历史逐批加载。首次只核对最近 7 天，控制启动跟单前要翻阅的历史量。
     private static final long BASELINE_WINDOW = TimeUnit.DAYS.toMillis(7);
     private static final long BASELINE_EMPTY_WAIT = 5000;
     private static final long REGION_RETRY = 120000;
@@ -189,12 +185,22 @@ final class WebsiteCapture {
         final String name;
         final List<Rules.Signal> rows;
         final BigDecimal leaderMargin, profileMargin;
-        final boolean historyComplete, recovered;
+        final boolean historyComplete, recovered, joinedArchive;
         final String historyDetail, recoveryDetail;
         final long snapshotAt;
+        final Map<String, Integer> pageRepeatLimits;
+        final Map<Long, List<Rules.Signal>> provisional;
 
         Read(String name, List<Rules.Signal> rows, BigDecimal leaderMargin, BigDecimal profileMargin,
                 boolean historyComplete, String historyDetail, boolean recovered, String recoveryDetail, long snapshotAt) {
+            this(name, rows, leaderMargin, profileMargin, historyComplete, historyDetail, recovered, recoveryDetail,
+                    snapshotAt, false, Collections.emptyMap(), Collections.emptyMap());
+        }
+
+        private Read(String name, List<Rules.Signal> rows, BigDecimal leaderMargin, BigDecimal profileMargin,
+                boolean historyComplete, String historyDetail, boolean recovered, String recoveryDetail,
+                long snapshotAt, boolean joinedArchive, Map<String, Integer> pageRepeatLimits,
+                Map<Long, List<Rules.Signal>> provisional) {
             this.name = name;
             this.rows = rows;
             this.leaderMargin = leaderMargin;
@@ -204,18 +210,22 @@ final class WebsiteCapture {
             this.recovered = recovered;
             this.recoveryDetail = recoveryDetail;
             this.snapshotAt = snapshotAt;
+            this.joinedArchive = joinedArchive;
+            this.pageRepeatLimits = pageRepeatLimits;
+            this.provisional = provisional;
         }
 
         Read withRows(List<Rules.Signal> verified) {
             return new Read(name, verified, leaderMargin, profileMargin, historyComplete, historyDetail,
-                    recovered, recoveryDetail, snapshotAt);
+                    recovered, recoveryDetail, snapshotAt, joinedArchive, pageRepeatLimits, provisional);
+        }
+
+        Read withProvisional(Map<Long, List<Rules.Signal>> groups) {
+            return new Read(name, rows, leaderMargin, profileMargin, historyComplete, historyDetail,
+                    recovered, recoveryDetail, snapshotAt, joinedArchive, pageRepeatLimits, groups);
         }
     }
 
-    /**
-     * 一轮网页读取的状态。document 标识实际网页，resumeDocument 标识希望续读的那一页。
-     * 翻页和日期选择都依赖当前文档里的控件与列表，页面被回收后需要重新验证重合记录。
-     */
     static final class Poll {
         final Rules.Signal anchor;
         final Predicate<List<Rules.Signal>> archiveOverlap;
@@ -249,12 +259,14 @@ final class WebsiteCapture {
         int calendarMoves, rangeRetries, emptyScriptReplies;
         String resumeDocument;
         boolean triedRange, overlapping, firstPageDisjoint, rereadEmpty, restartedPagination;
+        boolean tryArchiveJoin, matchesArchive;
         boolean verifyEmptyAgain;
         boolean cutoffReached, rangePriming, rangeRefreshed;
         boolean endBeforeStart, rangeEndAlreadySelected;
         boolean rangeConfirmed, reopenedDatePage;
         boolean baselineEndObserved, allowEmptyPartition;
-        boolean reviewPageOverlap;
+        boolean reviewPageOverlap, targetedReview;
+        final Map<String, Integer> pageRepeatLimits = new LinkedHashMap<>();
         boolean javascriptResponded, baselineScriptRestarted;
         Poll(Rules.Signal anchor, Predicate<List<Rules.Signal>> archiveOverlap, boolean profile, boolean baseline) {
             this(anchor, archiveOverlap, profile, baseline, 0);
@@ -285,11 +297,14 @@ final class WebsiteCapture {
             next.pagination = pagination.resume();
             next.lastRows = lastRows;
             next.lastText = lastText;
+            next.pageRepeatLimits.putAll(pageRepeatLimits);
             next.name = name;
             next.leaderMargin = leaderMargin;
             next.profileMargin = profileMargin;
             next.snapshotAt = snapshotAt;
             next.overlapping = overlapping;
+            next.tryArchiveJoin = tryArchiveJoin;
+            next.matchesArchive = matchesArchive;
             next.firstPageDisjoint = firstPageDisjoint;
             next.displayedRange = displayedRange;
             next.requestedRange = requestedRange;
@@ -311,17 +326,15 @@ final class WebsiteCapture {
             if (balances != null) return BALANCE_DEADLINE;
             if (profile) return DEADLINE;
             if (continuingBaseline()) return BASELINE_CONTINUATION_DEADLINE;
+            if (targetedReview) return 15000;
             return baseline ? BASELINE_DEADLINE : reviewing() ? REVIEW_DEADLINE : RECOVERY_DEADLINE;
         }
     }
 
-    /**
-     * 在同一次跟踪期间暂存已核对的建档候选。续读成功才推进 cursor，保留首轮读取确定的时间窗。
-     * 重开网页、日期控件迟到或新旧页无法对齐时，调用方可以继续使用已经接受的候选。
-     */
     static final class BaselineProgress {
         Poll cursor;
         final Read first;
+        final Map<String, Integer> pageRepeatLimits = new LinkedHashMap<>();
         List<Rules.Signal> rows;
         LocalDate verifiedBoundary;
         boolean emptyPartitionSeen;
@@ -330,6 +343,7 @@ final class WebsiteCapture {
             this.cursor = cursor;
             this.first = first;
             rows = first.rows;
+            pageRepeatLimits.putAll(first.pageRepeatLimits);
         }
 
         boolean accept(Poll poll, Read part) {
@@ -341,6 +355,7 @@ final class WebsiteCapture {
             } else {
                 rows = LeaderHistory.reconcileBaselineOverlap(rows, part.rows);
             }
+            part.pageRepeatLimits.forEach(pageRepeatLimits::putIfAbsent);
             cursor = poll;
             return true;
         }
@@ -352,7 +367,6 @@ final class WebsiteCapture {
             return !reread.displayedRange.start.isAfter(start) && TradeReview.same(rows, part.rows);
         }
 
-        // 较早日期段必须紧接已核对的交界日。空结果可能来自日期切换时的短暂空白，需重开复查。
         boolean acceptEarlier(Poll poll, Read part) {
             DateRange range = poll.requestedRange;
             if (range == null || !range.matches(poll.displayedRange) || verifiedBoundary == null
@@ -370,6 +384,7 @@ final class WebsiteCapture {
             combined.addAll(rows);
             LeaderHistory.verify(combined);
             rows = combined;
+            part.pageRepeatLimits.forEach(pageRepeatLimits::putIfAbsent);
             cursor = poll;
             verifiedBoundary = null;
             emptyPartitionSeen = false;
@@ -377,8 +392,13 @@ final class WebsiteCapture {
         }
 
         Read report(String detail, boolean complete, boolean recovered) {
+            return report(detail, complete, recovered, false);
+        }
+
+        Read report(String detail, boolean complete, boolean recovered, boolean joinedArchive) {
             return new Read(first.name, rows, first.leaderMargin, first.profileMargin, complete, detail,
-                    recovered, first.recoveryDetail, first.snapshotAt);
+                    recovered, first.recoveryDetail, first.snapshotAt, joinedArchive,
+                    new LinkedHashMap<>(pageRepeatLimits), Collections.emptyMap());
         }
     }
 
@@ -458,15 +478,22 @@ final class WebsiteCapture {
 
     Read fetch(Rules.Signal anchor, Predicate<List<Rules.Signal>> archiveOverlap, boolean baseline,
             boolean verifyEmptyAgain) throws Exception {
+        return fetch(anchor, archiveOverlap, baseline, verifyEmptyAgain, false);
+    }
+
+    Read fetch(Rules.Signal anchor, Predicate<List<Rules.Signal>> archiveOverlap, boolean baseline,
+            boolean verifyEmptyAgain, boolean tryArchiveJoin) throws Exception {
         Poll poll = new Poll(anchor, archiveOverlap, false, baseline);
         poll.verifyEmptyAgain = verifyEmptyAgain;
+        poll.tryArchiveJoin = tryArchiveJoin;
         if (!baseline) {
             baselineAccepted();
             return waitFor(poll);
         }
         if (pendingBaseline != null) return pendingBaseline;
         Read result = baselineProgress == null ? readBaseline(poll) : resumeBaseline(baselineProgress, poll);
-        // 同秒成交可能需要分几轮独立复核。保留这份候选直到档案提交成功，避免每次复核都重新建档。
+        // The archive can require several rounds of independent same-second reviews.
+        // Keep the frozen rows until the caller has committed the baseline.
         if (result.historyComplete) pendingBaseline = result;
         return result;
     }
@@ -476,7 +503,6 @@ final class WebsiteCapture {
         baselineProgress = null;
     }
 
-    // 4.3.9 的首次建档优先沿官网原列表展开。保留同一个文档可避免日期筛选引起的重载和交界重读。
     private Read readBaseline(Poll poll) throws Exception {
         Read read = waitFor(poll);
         if (poll.cutoffReached || read.historyComplete || read.rows.isEmpty() || poll.baselineZone == null) return read;
@@ -493,7 +519,9 @@ final class WebsiteCapture {
         String detail = "官网基线从已读页续读";
         try {
             Read part = waitFor(retry);
+            if (part.joinedArchive) return part;
             if (progress.accept(retry, part)) {
+                if (connectsToArchive(initial, progress.rows)) return finishBaseline(progress, initial);
                 if (retry.cutoffReached || (part.historyComplete && !hasEarlierUnverifiedDates(retry, part.rows))) {
                     return finishBaseline(progress, initial);
                 }
@@ -510,7 +538,6 @@ final class WebsiteCapture {
         return continueBaseline(progress, initial, detail, false);
     }
 
-    // 系统回收原网页时，继承 7 天范围并从新页面开始核对。旧候选要等重合记录对齐后才能合并。
     private Read resumeInitialBaseline(BaselineProgress progress, Poll fresh) throws Exception {
         String detail = "官网基线从已读页续读";
         Poll poll = progress.cursor.resumeBaseline();
@@ -526,10 +553,12 @@ final class WebsiteCapture {
                 poll = fresh;
                 part = waitFor(poll);
             }
+            if (part.joinedArchive) return part;
             if ("empty".equals(poll.phase)) {
                 return continueBaseline(progress, fresh, detail + " · 官网暂未返回原有成交", false);
             }
             if (progress.accept(poll, part)) {
+                if (connectsToArchive(fresh, progress.rows)) return finishBaseline(progress, fresh);
                 if (part.historyComplete) return finishBaseline(progress, fresh);
                 detail = part.historyDetail;
             } else detail += " · 官网暂未返回原有成交";
@@ -542,11 +571,6 @@ final class WebsiteCapture {
         return progress.report(detail + " · 本次建档已保留 " + progress.rows.size() + " 笔", false, false);
     }
 
-    /**
-     * 原列表卡住时尝试把结束日期缩到最早已读记录所在日，让官网从交界日重新提供成交。
-     * 缩窗仍可能遇到卡页或迟到的控件。只接收已应用目标日期且交界记录能对齐的结果，
-     * 同一窗口迟迟无法前进时交回已核对的候选和进度，供下一轮继续。
-     */
     private Read continueBaseline(BaselineProgress progress, Poll initial, String detail, boolean reopen) throws Exception {
         Poll preceding = progress.cursor;
         for (int attempt = 0; attempt < BASELINE_CONTINUATIONS; attempt++) {
@@ -566,6 +590,7 @@ final class WebsiteCapture {
                     break;
                 }
                 detail += " · 日期续读至 " + older.requestedRange.end;
+                if (connectsToArchive(initial, progress.rows)) return finishBaseline(progress, initial);
                 if (older.cutoffReached || (part.historyComplete && !hasEarlierUnverifiedDates(older, part.rows))) {
                     return finishBaseline(progress, initial);
                 }
@@ -618,10 +643,6 @@ final class WebsiteCapture {
         return Instant.ofEpochMilli(rows.get(0).time).atZone(zone).toLocalDate().isAfter(first);
     }
 
-    /**
-     * 单独读完交界日后，再查询前一天及更早的范围。把卡住的交界日和更早日期分开读取，
-     * 合并时用相邻的日期范围防止跳过整天。日期控件不可用时，调用方可尝试重开原列表核对。
-     */
     private Read continueByDatePartitions(BaselineProgress progress, Poll initial, String detail) throws Exception {
         ZoneId zone = progress.cursor.baselineZone;
         LocalDate first = Instant.ofEpochMilli(progress.cursor.baselineCutoff).atZone(zone).toLocalDate();
@@ -642,6 +663,7 @@ final class WebsiteCapture {
                         break;
                     }
                     progress.verifiedBoundary = day;
+                    if (connectsToArchive(initial, progress.rows)) return finishBaseline(progress, initial);
                 }
                 detail += " · 已核对交界日 " + progress.verifiedBoundary;
                 Poll earlier = new Poll(null, rows -> true, false, true);
@@ -652,7 +674,9 @@ final class WebsiteCapture {
                 earlier.reopenedDatePage = progress.emptyPartitionSeen;
                 earlier.priorRangeText = progress.cursor.lastText;
                 Read part = waitFor(earlier);
-                if (progress.acceptEarlier(earlier, part)) return finishBaseline(progress, initial);
+                if (progress.acceptEarlier(earlier, part) || connectsToArchive(initial, progress.rows)) {
+                    return finishBaseline(progress, initial);
+                }
                 if (!part.historyComplete && !hasEarlierUnverifiedDates(earlier, part.rows)) {
                     detail += " · 更早日期 " + first + " 至 " + end + " 待复核";
                     break;
@@ -670,10 +694,16 @@ final class WebsiteCapture {
     private boolean retryRawBaseline(BaselineProgress progress, Poll initial) throws Exception {
         // A fresh page can still paginate when the date control stays hidden or cannot apply a range.
         Poll reread = new Poll(initial.anchor, initial.archiveOverlap, false, true);
+        reread.tryArchiveJoin = initial.tryArchiveJoin;
         inheritBaselineWindow(reread, progress.cursor);
         try {
             Read part = waitFor(reread);
             if (part.rows.isEmpty()) return false;
+            if (part.joinedArchive) {
+                progress.rows = part.rows;
+                progress.cursor = reread;
+                return true;
+            }
             boolean shortWindow = !hasEarlierUnverifiedDates(progress.cursor, progress.rows)
                     && progress.confirmsShortWindow(reread, part);
             boolean ended = reread.cutoffReached || shortWindow || (reread.initialBaseline() && part.historyComplete);
@@ -681,6 +711,7 @@ final class WebsiteCapture {
             List<Rules.Signal> merged = LeaderHistory.reconcileBaselineOverlap(progress.rows, part.rows);
             if (!ended && merged.size() <= progress.rows.size()) return false;
             progress.rows = merged;
+            part.pageRepeatLimits.forEach(progress.pageRepeatLimits::putIfAbsent);
             progress.cursor = reread;
             return ended;
         } catch (LeaderHistory.Gap mismatch) {
@@ -695,9 +726,16 @@ final class WebsiteCapture {
         return failure.access == Access.NONE && !failure.stop && failure.backoffMs <= 3000;
     }
 
+    private static boolean connectsToArchive(Poll poll, List<Rules.Signal> rows) {
+        return poll.tryArchiveJoin && !rows.isEmpty() && poll.archiveOverlap.test(rows);
+    }
+
     private Read finishBaseline(BaselineProgress progress, Poll initial) {
         boolean overlaps = initial.anchor == null || initial.archiveOverlap.test(progress.rows);
         if (overlaps) baselineProgress = null;
+        if (connectsToArchive(initial, progress.rows)) {
+            return progress.report("已核对重合 · " + progress.rows.size() + " 笔", true, false, true);
+        }
         String report = (overlaps ? (progress.cursor.cutoffReached ? "官网已核对 7 天建档窗口" : "官网基线已读到末尾")
                 : "官网基线仍未衔接旧档案")
                 + " · " + progress.rows.size() + " 笔";
@@ -713,6 +751,12 @@ final class WebsiteCapture {
 
     List<Rules.Signal> review(long stamp) throws Exception {
         return TradeReview.at(waitFor(new Poll(null, rows -> false, false, false, stamp)).rows, stamp);
+    }
+
+    List<Rules.Signal> reviewProvisional(long stamp) throws Exception {
+        Poll poll = new Poll(null, rows -> false, false, false, stamp);
+        poll.targetedReview = true;
+        return TradeReview.at(waitFor(poll).rows, stamp);
     }
 
     List<ClosedTradeReview.Position> closedPositions() throws Exception {
@@ -802,8 +846,7 @@ final class WebsiteCapture {
         }
     }
 
-    private WebView newPage() {
-        WebView view = new WebView(context);
+    private static void configurePage(WebView view) {
         view.getSettings().setJavaScriptEnabled(true);
         view.getSettings().setDomStorageEnabled(true);
         view.getSettings().setAllowFileAccess(false);
@@ -811,9 +854,47 @@ final class WebsiteCapture {
         view.getSettings().setMixedContentMode(android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         view.getSettings().setUseWideViewPort(true);
         view.getSettings().setLoadWithOverviewMode(true);
+        view.getSettings().setSupportMultipleWindows(false);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(view, false);
+    }
+
+    static WebView openPreview(String portfolio, FrameLayout host) {
+        String address = portfolioUrl(portfolio);
+        WebView view = new WebView(host.getContext());
+        try {
+            configurePage(view);
+            view.setWebViewClient(new WebViewClient() {
+                @Override public boolean shouldOverrideUrlLoading(WebView source, WebResourceRequest request) {
+                    return request.isForMainFrame() && !previewAddress(request.getUrl());
+                }
+            });
+            host.addView(view, new FrameLayout.LayoutParams(-1, -1));
+            view.loadUrl(address);
+            return view;
+        } catch (RuntimeException failure) {
+            closePreview(host, view);
+            throw failure;
+        }
+    }
+
+    static void closePreview(FrameLayout host, WebView view) {
+        host.removeView(view);
+        view.stopLoading();
+        view.destroy();
+    }
+
+    static boolean previewAddress(Uri address) {
+        String domain = address.getHost();
+        return "https".equals(address.getScheme()) && address.getUserInfo() == null
+                && (address.getPort() == -1 || address.getPort() == 443)
+                && ("www.binance.com".equals(domain) || "accounts.binance.com".equals(domain));
+    }
+
+    private WebView newPage() {
+        WebView view = new WebView(context);
+        configurePage(view);
         view.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
         view.setFocusable(false);
-        CookieManager.getInstance().setAcceptThirdPartyCookies(view, false);
         view.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView source, WebResourceRequest request) {
                 if (!request.isForMainFrame() || safe(request.getUrl().toString())) return false;
@@ -927,8 +1008,6 @@ final class WebsiteCapture {
 
     private interface Observation { void received(JSONObject data) throws Exception; }
 
-    // JavaScript 回调可能晚于本轮超时或 WebView 重建。回调前重新检查轮次和 WebView，
-    // 同一 WebView 内的刷新则由脚本用 document 标记识别旧页面。
     private void evaluate(Poll poll, JSONObject request, Observation callback) {
         WebView view = page;
         Runnable timeout = () -> {
@@ -961,7 +1040,6 @@ final class WebsiteCapture {
         });
     }
 
-    // WebView 偶尔停止回传脚本结果。优先交回已读列表供续读，手里还没有记录时只重建一次页面。
     private void baselineScriptFailed(Poll poll) {
         destroyPage();
         String reason = "网页脚本未返回，已保留可续读记录";
@@ -989,10 +1067,6 @@ final class WebsiteCapture {
         }
     }
 
-    /**
-     * 处理脚本返回的单次观测。日期字段、成交文本和翻页按钮可能在不同时间就绪，
-     * 由这里确认筛选生效、列表稳定和重合证据，再推进分页状态。
-     */
     private void observe(Poll poll, JSONObject data) throws Exception {
         String phase = data.optString("phase");
         poll.phase = phase;
@@ -1043,7 +1117,7 @@ final class WebsiteCapture {
             if (poll.controlsSince == 0) poll.controlsSince = now;
             DateRange requested = poll.requestedRange;
             if (!busy && !loading && requested != null && data.optBoolean("datePicker")) {
-                // 重选相同日期可能无法触发官网刷新。多日窗口先暂时缩短一天，再恢复目标范围。
+                // Picking an unchanged range may be a no-op on the site.
                 poll.rangePriming = requested.matches(displayed) && requested.start.isBefore(requested.end);
                 LocalDate start = poll.rangePriming ? requested.start.plusDays(1) : requested.start;
                 beginRange(poll, start, requested.end, data, now);
@@ -1153,7 +1227,6 @@ final class WebsiteCapture {
                     return;
                 }
                 if (poll.anchor == null) {
-                    // 首次看到稳定空页仍会重开复查，防止把官网的短暂空白写成一份空基线。
                     if (poll.verifyEmptyAgain && !poll.rereadEmpty) {
                         poll.rereadEmpty = true;
                         restartRows(poll);
@@ -1190,16 +1263,19 @@ final class WebsiteCapture {
                     }
                     List<Rules.Signal> rows = parse(data, displayed == null ? poll.displayedRange : displayed);
                     LeaderHistory.verify(rows);
+                    if (!poll.lastRows.isEmpty()) older = LeaderHistory.pageGrowth(poll.lastRows, rows);
+                    poll.matchesArchive = connectsToArchive(poll, rows);
+                    poll.overlapping = poll.anchor == null || poll.archiveOverlap.test(rows);
                     if (poll.lastRows.isEmpty()) {
-                        poll.overlapping = poll.anchor == null || poll.archiveOverlap.test(rows);
                         poll.firstPageDisjoint = !poll.overlapping;
                         poll.snapshotAt = now;
                     } else {
-                        older = LeaderHistory.pageGrowth(poll.lastRows, rows);
+                        if (poll.baseline && older > 0 && poll.pagination.inFlight()) {
+                            TradeReview.recordPageRepeats(poll.lastRows, rows, poll.pageRepeatLimits);
+                        }
                         if (poll.reviewing() && TradeReview.addsIdenticalTrade(poll.lastRows, rows, poll.reviewStamp)) {
                             poll.reviewPageOverlap = true;
                         }
-                        if (!poll.overlapping) poll.overlapping = poll.archiveOverlap.test(rows);
                         long latest = poll.lastRows.get(poll.lastRows.size() - 1).time;
                         if (rows.get(rows.size() - 1).time > latest
                                 || TradeReview.at(rows, latest).size() > TradeReview.at(poll.lastRows, latest).size()) {
@@ -1233,11 +1309,10 @@ final class WebsiteCapture {
             if (poll.baseline && poll.baselineZone == null && !busy && !loading
                     && "rows".equals(phase) && poll.parseIssue.isEmpty()) {
                 poll.baselineZone = ZoneId.of(data.getString("zone"));
-                // 用首批可解析且未在加载的列表锁定上下限，后续新出现的成交留给建档后的轮询。
                 poll.baselineNewest = poll.lastRows.get(poll.lastRows.size() - 1).time;
                 poll.baselineCutoff = poll.baselineNewest - BASELINE_WINDOW;
             }
-            if (poll.baseline && settled && !busy && !loading && "rows".equals(phase)
+            if (poll.baseline && !poll.matchesArchive && settled && !busy && !loading && "rows".equals(phase)
                     && poll.parseIssue.isEmpty() && poll.lastRows.get(0).time < poll.baselineCutoff) {
                 poll.cutoffReached = true;
                 complete(poll, poll.overlapping);
@@ -1256,7 +1331,7 @@ final class WebsiteCapture {
             boolean targetPresent = poll.reviewing() ? !TradeReview.at(poll.lastRows, poll.reviewStamp).isEmpty() : poll.overlapping;
             HistoryPagination.Step step = poll.pagination.observe(poll.lastRows.size(), older, targetPresent,
                     moreAvailable, data.optBoolean("moreReady"), busy,
-                    loading || !settled || !"rows".equals(phase) || !poll.parseIssue.isEmpty(), now);
+                    loading || !settled || !"rows".equals(phase) || !poll.parseIssue.isEmpty(), now, poll.matchesArchive);
             if (step == HistoryPagination.Step.CLICK) {
                 evaluate(poll, request(poll).put("command", "more"), more -> {
                     if (more.optBoolean("clicked")) {
@@ -1267,7 +1342,7 @@ final class WebsiteCapture {
                 return;
             }
             if (step == HistoryPagination.Step.END || step == HistoryPagination.Step.INCOMPLETE) {
-                if (step == HistoryPagination.Step.END && poll.baseline && !poll.initialBaseline()
+                if (step == HistoryPagination.Step.END && poll.baseline && !poll.matchesArchive && !poll.initialBaseline()
                         && !poll.continuingBaseline()) {
                     poll.baselineEndObserved = true;
                     poll.parseIssue = "官网未显示「更多」，重新选择日期核对";
@@ -1395,14 +1470,13 @@ final class WebsiteCapture {
         poll.balances.complete(new LeaderBalances.Read(poll.balanceMargin, transfers, done, issue));
     }
 
-    // 到达时间边界后仍保留边界当秒。补旧档还要检查缩窗后的结果能否接上已有水位。
     private void complete(Poll poll, boolean ended) {
         if (poll.reviewing() && !ended) {
             fallbackReview(poll, "官网分页复核未完成");
             return;
         }
         if (poll.reviewing() && poll.reviewPageOverlap) {
-            // 重复同样的分页拼接仍无法确定同秒笔数，改用独立读取。
+            // Repeating the same page join cannot establish the number of identical trades.
             fallbackReview(poll, "同一笔样式的成交在分页拼接后增多，笔数待核对");
             return;
         }
@@ -1411,10 +1485,16 @@ final class WebsiteCapture {
             fallbackReview(poll, "官网在待核对的同一秒结束，尚未确认该秒完整");
             return;
         }
+        if (poll.targetedReview && (poll.lastRows.isEmpty() || poll.lastRows.get(0).time >= poll.reviewStamp
+                || poll.lastRows.get(poll.lastRows.size() - 1).time <= poll.reviewStamp)) {
+            fail(reviewFailure("所选日期未完整覆盖待核对的这一秒"));
+            return;
+        }
         current = null;
+        boolean joinedArchive = ended && poll.matchesArchive;
         List<Rules.Signal> rows = new ArrayList<>(poll.lastRows.size());
         for (Rules.Signal signal : poll.lastRows) {
-            if (!poll.baseline || (signal.time >= poll.baselineCutoff
+            if (!poll.baseline || joinedArchive || (signal.time >= poll.baselineCutoff
                     && (poll.baselineNewest == 0 || signal.time <= poll.baselineNewest))) {
                 rows.add(poll.reviewing() ? signal : signal.withLeaderMargin(poll.leaderMargin));
             }
@@ -1425,7 +1505,7 @@ final class WebsiteCapture {
             poll.parseIssue = "7 天建档窗口内仍未衔接旧档案";
         }
         String report = poll.baseline || poll.firstPageDisjoint
-                ? poll.pagination.report(SystemClock.elapsedRealtime(), rows.size(), ended) : "";
+                ? poll.pagination.report(SystemClock.elapsedRealtime(), rows.size(), ended, joinedArchive) : "";
         if (!ended && !report.isEmpty() && poll.parseIssue != null && !poll.parseIssue.isEmpty()) {
             report += " · " + poll.parseIssue;
         }
@@ -1433,7 +1513,9 @@ final class WebsiteCapture {
         if (poll.restartedPagination && !report.isEmpty()) report += " · 已重新打开列表核对";
         poll.result.complete(new Read(poll.name, rows, poll.leaderMargin,
                 poll.leaderMargin == null ? poll.profileMargin : poll.leaderMargin, poll.baseline && ended,
-                poll.baseline ? report : "", ended && poll.firstPageDisjoint, poll.firstPageDisjoint ? report : "", poll.snapshotAt));
+                poll.baseline ? report : "", ended && poll.firstPageDisjoint, poll.firstPageDisjoint ? report : "",
+                poll.snapshotAt, joinedArchive,
+                new LinkedHashMap<>(poll.pageRepeatLimits), Collections.emptyMap()));
     }
 
     private boolean selectRange(Poll poll, JSONObject data, long now) throws Exception {
@@ -1493,8 +1575,11 @@ final class WebsiteCapture {
         return true;
     }
 
-    // 日期筛选无法证明待核对的一整秒时，重开无筛选列表，再逐页寻找可独立核对的样本。
     private void fallbackReview(Poll poll, String reason) {
+        if (poll.targetedReview) {
+            fail(reviewFailure(reason));
+            return;
+        }
         if (poll.unfilteredReview()) {
             fail(reviewFailure(reason + " · 已尝试逐页核对（" + poll.reviewFallback + "）"));
             return;
@@ -1508,6 +1593,7 @@ final class WebsiteCapture {
     private void restartRows(Poll poll) {
         poll.selectingDate = null;
         poll.reviewPageOverlap = false;
+        poll.matchesArchive = false;
         poll.clickedAt = poll.emptySince = poll.controlsSince = poll.pageErrorUntil = 0;
         poll.lastRows = Collections.emptyList();
         poll.displayedRange = null;

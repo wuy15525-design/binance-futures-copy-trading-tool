@@ -6,10 +6,6 @@ import java.util.UUID;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/**
- * 手动测试网委托使用单独的本机流水，按账户指纹恢复待核对订单和演练仓位。
- * 账户切换前先核对旧流水，避免用新账户解释旧委托的结果。
- */
 final class DemoOrders {
     private static final String FILE = "demo-orders";
     private static final BigDecimal FEE_BUFFER = new BigDecimal("0.001");

@@ -5,10 +5,6 @@ import static com.localcopy.terminal.Rules.ZERO;
 import java.math.BigDecimal;
 import java.util.List;
 
-/**
- * 从上次观测的仓位重放账户成交，以委托号分开本应用成交和外部成交。
- * 只有本单成交量和最终多空仓都能对齐，才把额外变动和可核对盈亏归为外部操作。
- */
 final class AccountMovement {
     private BigDecimal longPnl = ZERO, shortPnl = ZERO;
     private boolean longClosed, shortClosed;

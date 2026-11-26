@@ -10,10 +10,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * 核对同秒成交样本。官网卡片中可能有同价、同量的真实多笔成交，分页拼接也可能重复同一笔。
- * 重复指纹用于标记整秒待核对。复核时结合成交额、盈亏与相对顺序，保留官网确认的笔数。
- */
 final class TradeReview {
     private TradeReview() {}
 
@@ -53,6 +49,140 @@ final class TradeReview {
             if (left != null && left < 0) return true;
         }
         return false;
+    }
+
+    static void recordPageRepeats(List<Rules.Signal> before, List<Rules.Signal> after, Map<String, Integer> limits) {
+        Map<String, Integer> known = counts(before);
+        for (Map.Entry<String, Integer> entry : counts(after).entrySet()) {
+            Integer count = known.get(entry.getKey());
+            if (count != null && entry.getValue() > count) limits.putIfAbsent(entry.getKey(), count);
+        }
+    }
+
+    static Map<String, Integer> counts(List<Rules.Signal> rows) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (Rules.Signal row : rows) counts.merge(key(row), 1, Integer::sum);
+        return counts;
+    }
+
+    static List<Rules.Signal> limitCopies(List<Rules.Signal> rows, Map<String, Integer> limits) {
+        List<Rules.Signal> kept = new ArrayList<>();
+        Map<String, Integer> remaining = new LinkedHashMap<>(limits);
+        for (Rules.Signal row : rows) {
+            Integer left = remaining.computeIfPresent(key(row), (ignored, n) -> n - 1);
+            if (left == null || left >= 0) kept.add(row);
+        }
+        return kept;
+    }
+
+    static Set<String> repeatedLegs(List<Rules.Signal> rows) {
+        Set<String> legs = new LinkedHashSet<>();
+        Set<String> seen = new HashSet<>();
+        for (Rules.Signal row : rows) {
+            if (seen.add(row.fingerprint)) continue;
+            if (row.reportedAction.sideOnly()) {
+                legs.add(row.symbol + "|LONG");
+                legs.add(row.symbol + "|SHORT");
+            } else legs.add(row.leg());
+        }
+        return legs;
+    }
+
+    static final class BaselineCounts {
+        final List<Rules.Signal> rows;
+        final Map<Long, List<Rules.Signal>> settled;
+
+        BaselineCounts(List<Rules.Signal> rows, Map<Long, List<Rules.Signal>> settled) {
+            this.rows = rows;
+            this.settled = settled;
+        }
+    }
+
+    static BaselineCounts baselineCounts(List<Rules.Signal> raw) {
+        return baselineCounts(raw, null);
+    }
+
+    static BaselineCounts baselineCounts(List<Rules.Signal> raw, Set<Long> pending) {
+        Map<Long, List<Rules.Signal>> repeated = repeatedSeconds(raw);
+        if (pending != null) repeated.keySet().retainAll(pending);
+        if (repeated.isEmpty()) return new BaselineCounts(raw, Collections.emptyMap());
+        Set<String> openings = new HashSet<>();
+        List<Rules.Signal> rows = new ArrayList<>();
+        for (Rules.Signal row : raw) {
+            if (!repeated.containsKey(row.time) || !knownAction(row) || !row.action.opens
+                    || openings.add(key(row))) rows.add(row);
+        }
+        Map<String, Integer> copies = counts(rows);
+        Map<String, BigDecimal> minimum = new LinkedHashMap<>();
+        Map<String, Integer> firstClose = new LinkedHashMap<>();
+        for (int i = 0; i < rows.size(); i++) {
+            Rules.Signal row = rows.get(i);
+            if (knownAction(row) && !row.action.opens) firstClose.putIfAbsent(key(row), i);
+        }
+        BigDecimal[] requiredAfter = new BigDecimal[rows.size()];
+        // Reserve one of each distinct later close up to the next opening on this side.
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            Rules.Signal row = rows.get(i);
+            if (!knownAction(row)) {
+                minimum.remove(row.symbol + "|LONG");
+                minimum.remove(row.symbol + "|SHORT");
+            } else if (row.action.opens) {
+                minimum.remove(row.leg());
+            } else {
+                String leg = row.leg();
+                BigDecimal reserved = minimum.getOrDefault(leg, Rules.ZERO);
+                requiredAfter[i] = reserved;
+                if (!repeated.containsKey(row.time) || firstClose.get(key(row)) == i) {
+                    minimum.put(leg, reserved.add(row.quantity));
+                }
+            }
+        }
+        Map<String, BigDecimal> available = new LinkedHashMap<>();
+        Set<String> unpaired = new HashSet<>();
+        Set<Long> unresolved = new HashSet<>();
+        List<Rules.Signal> kept = new ArrayList<>(rows.size());
+        Map<Long, List<Rules.Signal>> settled = new LinkedHashMap<>();
+        for (int i = 0; i < rows.size(); i++) {
+            Rules.Signal row = rows.get(i);
+            String leg = row.leg();
+            if (!knownAction(row)) {
+                unpaired.add(row.symbol + "|LONG");
+                unpaired.add(row.symbol + "|SHORT");
+                unresolved.add(row.time);
+            } else if (row.action.opens) {
+                available.merge(leg, row.quantity, BigDecimal::add);
+            } else {
+                String identity = key(row);
+                BigDecimal before = available.getOrDefault(leg, Rules.ZERO);
+                boolean first = firstClose.get(identity) == i;
+                boolean sameClose = repeated.containsKey(row.time) && copies.get(identity) > 1;
+                BigDecimal needed = row.quantity.add(requiredAfter[i]);
+                if (sameClose && !first && !unpaired.contains(leg) && before.compareTo(needed) < 0) continue;
+                if (before.compareTo(row.quantity) < 0 || (sameClose && first && before.compareTo(needed) < 0)) {
+                    unpaired.add(leg);
+                }
+                if (sameClose && unpaired.contains(leg)) unresolved.add(row.time);
+                available.put(leg, before.subtract(row.quantity).max(Rules.ZERO));
+            }
+            kept.add(row);
+            if (repeated.containsKey(row.time)) settled.computeIfAbsent(row.time, ignored -> new ArrayList<>()).add(row);
+        }
+        settled.entrySet().removeIf(entry -> unresolved.contains(entry.getKey())
+                || hasDifferentDetails(repeated.get(entry.getKey())));
+        return new BaselineCounts(kept, settled);
+    }
+
+    private static boolean hasDifferentDetails(List<Rules.Signal> rows) {
+        Map<String, String> keys = new LinkedHashMap<>();
+        for (Rules.Signal row : rows) {
+            String key = key(row), previous = keys.putIfAbsent(row.fingerprint, key);
+            if (previous != null && !previous.equals(key)) return true;
+        }
+        return false;
+    }
+
+    static boolean knownAction(Rules.Signal row) {
+        return !row.reportedAction.sideOnly();
     }
 
     static boolean compatible(List<Rules.Signal> raw, List<Rules.Signal> checked) {

@@ -9,8 +9,8 @@ android {
         applicationId "com.localcopy.terminal"
         minSdk 33
         targetSdk 37
-        versionCode 40
-        versionName "4.3.9"
+        versionCode 48
+        versionName "4.3.17"
         buildConfigField "String", "RELEASE_CERT_SHA256", '""'
     }
     buildFeatures {
@@ -18,7 +18,7 @@ android {
     }
     buildTypes {
         debug {
-            applicationIdSuffix ".sandbox"
+            applicationIdSuffix ".sandbox437"
         }
         release {
             minifyEnabled true

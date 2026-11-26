@@ -7,6 +7,7 @@ import static com.localcopy.terminal.Rules.ZERO;
 import java.math.BigDecimal;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.LinkedHashMap;
@@ -16,10 +17,6 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/**
- * 一个账户的一轮跟单账本。每个合约的多空方向分别记录带单仓位、本机纳入跟单的数量、
- * 待执行意向及实际仓位观测。档案水位和待核对委托随账本保存，供中断后接续。
- */
 final class FollowBook {
     static final class Entry {
         Rules.Signal signal;
@@ -27,8 +24,9 @@ final class FollowBook {
         BigDecimal fraction = ONE;
         BigDecimal remaining, margin, nominalLeft, recoveryAverage;
         BigDecimal rejectedQuantity = ZERO, rejectedNotional = ZERO, reportedMinimum = ZERO;
-        boolean cancelled, filled;
-        String requestIssue = "";
+        boolean cancelled, filled, resizedByCopySettings;
+        String requestIssue = "", waitReason = "";
+        long lastUnfilled;
         int checkFailures;
         long checkFailedAt, checkRetryAt;
 
@@ -41,7 +39,13 @@ final class FollowBook {
 
         String id() { return existing ? "existing|" + signal.id : signal.id; }
 
+        boolean usesAdjustmentSlippage() { return existing || resizedByCopySettings; }
+
         BigDecimal referencePrice() { return recoveryAverage == null ? signal.price : recoveryAverage; }
+
+        BigDecimal referencePrice(BigDecimal leaderAverage) {
+            return existing && leaderAverage != null ? leaderAverage : referencePrice();
+        }
 
         boolean waitingForCheckRetry(long now) {
             return checkRetryAt > now && checkFailedAt <= now;
@@ -73,7 +77,10 @@ final class FollowBook {
             if (recoveryAverage != null) out.put("recoveryAverage", Rules.show(recoveryAverage));
             if (cancelled) out.put("cancelled", true);
             if (existing) out.put("existing", true);
+            if (resizedByCopySettings) out.put("resizedByCopySettings", true);
             if (!requestIssue.isEmpty()) out.put("requestIssue", requestIssue);
+            if (!waitReason.isEmpty()) out.put("waitReason", waitReason);
+            if (lastUnfilled > 0) out.put("lastUnfilled", lastUnfilled);
             if (checkFailures > 0) out.put("checkFailures", checkFailures).put("checkFailedAt", checkFailedAt)
                     .put("checkRetryAt", checkRetryAt);
             if (rejectedQuantity.signum() > 0) out.put("rejectedQuantity", Rules.show(rejectedQuantity));
@@ -86,7 +93,10 @@ final class FollowBook {
             Entry entry = new Entry(LocalData.readSignals(in.getJSONArray("signal")).get(0), in.optBoolean("existing"));
             entry.fraction = FuturesApi.decimal(in, "fraction");
             entry.cancelled = in.optBoolean("cancelled");
+            entry.resizedByCopySettings = in.optBoolean("resizedByCopySettings");
             entry.requestIssue = in.optString("requestIssue");
+            entry.waitReason = in.optString("waitReason");
+            entry.lastUnfilled = in.optLong("lastUnfilled");
             entry.checkFailures = Math.max(0, in.optInt("checkFailures"));
             entry.checkFailedAt = in.optLong("checkFailedAt");
             entry.checkRetryAt = in.optLong("checkRetryAt");
@@ -122,6 +132,8 @@ final class FollowBook {
         final String settingId;
         final BigDecimal leaderEntry;
         BigDecimal margin, reference;
+        String waitReason = "";
+        long lastUnfilled;
         BigDecimal legacyVisible, legacyRetained = ONE, legacyAdded = ZERO;
 
         CopyAdjustment(Rules.Signal signal) {
@@ -137,6 +149,7 @@ final class FollowBook {
         }
 
         boolean fromSetting() { return !settingId.isEmpty(); }
+        String label() { return fromSetting() ? "复制调仓" : "复制跟单"; }
         String id() { return fromSetting() ? settingId : "adjust|" + signal.id; }
         BigDecimal priceReference() { return fromSetting() ? reference : signal.price; }
         BigDecimal leaderMargin() {
@@ -153,6 +166,8 @@ final class FollowBook {
             }
             if (signal != null) out.put("signal", LocalData.signalJson(Collections.singletonList(signal)));
             if (target != null) out.put("target", Rules.show(target));
+            if (!waitReason.isEmpty()) out.put("waitReason", waitReason);
+            if (lastUnfilled > 0) out.put("lastUnfilled", lastUnfilled);
             if (legacyVisible != null) out.put("legacyVisible", Rules.show(legacyVisible))
                     .put("legacyRetained", Rules.show(legacyRetained)).put("legacyAdded", Rules.show(legacyAdded));
             return out;
@@ -168,6 +183,8 @@ final class FollowBook {
             adjustment.signal = signal;
             adjustment.target = FuturesApi.optionalDecimal(in, "target");
             adjustment.reference = FuturesApi.optionalDecimal(in, "reference");
+            adjustment.waitReason = in.optString("waitReason");
+            adjustment.lastUnfilled = in.optLong("lastUnfilled");
             adjustment.legacyVisible = FuturesApi.optionalDecimal(in, "legacyVisible");
             if (adjustment.legacyVisible != null) {
                 adjustment.legacyRetained = FuturesApi.decimal(in, "legacyRetained");
@@ -185,12 +202,13 @@ final class FollowBook {
         final String symbol;
         final boolean isLong;
         BigDecimal leader = ZERO, owned = ZERO, target = ZERO;
+        BigDecimal leaderAverage;
         BigDecimal pendingRetention = ONE;
         BigDecimal observed;
         long observedAt;
         boolean managed, protectedExisting;
         BigDecimal copied = ZERO;
-        boolean adjustOnSignal, legacyCopyScope;
+        boolean adjustOnSignal, legacyCopyScope, deferredAdjustmentSlippage;
         CopyAdjustment adjustment;
         Rules.Signal reducingSignal;
         private final Deque<Reduction> reductions = new ArrayDeque<>();
@@ -203,7 +221,12 @@ final class FollowBook {
 
         boolean adjusting() { return adjustOnSignal || adjustment != null; }
 
+        boolean adjustmentUsesCopySlippage() {
+            return deferredAdjustmentSlippage || (adjustment != null && adjustment.fromSetting());
+        }
+
         void clearAdjustment() {
+            deferredAdjustmentSlippage = false;
             adjustOnSignal = false;
             adjustment = null;
         }
@@ -227,6 +250,8 @@ final class FollowBook {
             next.signal = signal;
             next.target = null;
             next.margin = null;
+            next.waitReason = "";
+            next.lastUnfilled = 0;
             resetCopyOrders("");
             adjustOnSignal = false;
             adjustment = next;
@@ -357,11 +382,13 @@ final class FollowBook {
                     .put("leader", Rules.show(leader)).put("owned", Rules.show(owned))
                     .put("target", Rules.show(target)).put("retain", Rules.show(pendingRetention)).put("entries", pending)
                     .put("reductions", staged).put("managed", managed).put("protectedExisting", protectedExisting);
+            if (leaderAverage != null) data.put("leaderAverage", Rules.show(leaderAverage));
             if (observed != null) data.put("observed", Rules.show(observed)).put("observedAt", observedAt);
             if (reducingSignal != null) data.put("reducing", LocalData.signalJson(Collections.singletonList(reducingSignal)));
             if (copied.signum() > 0) data.put("copied", Rules.show(copied));
             if (legacyCopyScope) data.put("legacyCopyScope", true);
             if (adjustOnSignal) data.put("adjustOnSignal", true);
+            if (deferredAdjustmentSlippage) data.put("deferredAdjustmentSlippage", true);
             if (adjustment != null) data.put("copyAdjustment", adjustment.json());
             return data;
         }
@@ -369,6 +396,7 @@ final class FollowBook {
         static Leg read(JSONObject in, boolean legacyCopy) throws JSONException {
             Leg leg = new Leg(in.getString("symbol"), in.getBoolean("long"));
             leg.leader = FuturesApi.decimal(in, "leader");
+            leg.leaderAverage = FuturesApi.optionalDecimal(in, "leaderAverage");
             leg.owned = FuturesApi.decimal(in, "owned");
             leg.target = FuturesApi.decimal(in, "target");
             leg.pendingRetention = new BigDecimal(in.optString("retain", "1"));
@@ -394,6 +422,7 @@ final class FollowBook {
             leg.legacyCopyScope = in.optBoolean("legacyCopyScope", oldScope);
             leg.copied = copied == null ? (oldScope ? leg.leader : ZERO) : copied;
             leg.adjustOnSignal = in.optBoolean("adjustOnSignal");
+            leg.deferredAdjustmentSlippage = in.optBoolean("deferredAdjustmentSlippage");
             JSONObject adjustment = in.optJSONObject("copyAdjustment");
             if (adjustment != null) leg.adjustment = CopyAdjustment.read(adjustment);
             return leg;
@@ -415,7 +444,8 @@ final class FollowBook {
     JSONObject notice;
     int drillStage;
     long archiveCursor, baselineBackfilled, archiveRevision, portfolioSelection;
-    boolean initialChoiceDone, accountSeeded, baselineReady;
+    final Map<String, Long> reviewCursors = new LinkedHashMap<>();
+    boolean initialChoiceDone, accountSeeded, baselineReady, leaderAveragesVerified;
     long trackingSince, trackedMillis;
     BigDecimal realizedPnl = ZERO;
     boolean pnlIncomplete;
@@ -430,7 +460,6 @@ final class FollowBook {
         this.strategy = strategy;
     }
 
-    // 旧账本缺少策略或复制系数时沿用对应默认值。旧复制范围由后续调仓结合实际仓位补齐。
     static FollowBook restore(JSONObject saved) throws JSONException {
         FollowBook book = new FollowBook(LocalData.readConfig(saved.getJSONObject("config")), saved.getString("account"),
                 Rules.Strategy.read(saved.optString("strategy", "")));
@@ -441,6 +470,7 @@ final class FollowBook {
         book.copyReplanPending = saved.optBoolean("copyReplanPending");
         book.window = LocalData.readSignals(saved.getJSONArray("window"));
         book.baselineReady = saved.optBoolean("baselineReady", !book.window.isEmpty());
+        book.leaderAveragesVerified = saved.optBoolean("leaderAveragesVerified");
         book.initialChoiceDone = saved.optBoolean("initialChoiceDone", !book.window.isEmpty());
         book.accountSeeded = saved.optBoolean("accountSeeded");
         book.pending = saved.optJSONObject("pending");
@@ -452,6 +482,13 @@ final class FollowBook {
         book.archiveCursor = saved.optLong("archiveCursor");
         book.baselineBackfilled = saved.optLong("baselineBackfilled");
         book.archiveRevision = saved.optLong("archiveRevision");
+        JSONObject reviews = saved.optJSONObject("reviewCursors");
+        if (reviews != null) {
+            for (Iterator<String> keys = reviews.keys(); keys.hasNext();) {
+                String key = keys.next();
+                book.reviewCursors.put(key, reviews.getLong(key));
+            }
+        }
         book.portfolioSelection = saved.optLong("portfolioSelection");
         book.trackingSince = saved.optLong("trackingSince");
         book.trackedMillis = saved.optLong("trackedMillis");
@@ -475,7 +512,9 @@ final class FollowBook {
                 .put("notice", notice).put("log", log).put("detections", detections)
                 .put("drillStage", drillStage).put("archiveCursor", archiveCursor).put("legs", items)
                 .put("baselineBackfilled", baselineBackfilled).put("archiveRevision", archiveRevision)
+                .put("reviewCursors", new JSONObject(reviewCursors))
                 .put("portfolioSelection", portfolioSelection)
+                .put("leaderAveragesVerified", leaderAveragesVerified)
                 .put("initialChoiceDone", initialChoiceDone).put("accountSeeded", accountSeeded).put("baselineReady", baselineReady)
                 .put("trackingSince", trackingSince)
                 .put("trackedMillis", trackedMillis).put("realizedPnl", Rules.show(realizedPnl))
@@ -526,8 +565,14 @@ final class FollowBook {
             boolean inFlight = pending != null && leg.symbol.equals(pending.optString("symbol"))
                     && Rules.Action.valueOf(pending.getString("action")).isLong == leg.isLong;
             if (leg.owned.signum() == 0 && !inFlight) {
-                leg.adjustment = null;
+                if (leg.adjusting()) leg.deferredAdjustmentSlippage = true;
+                if (leg.adjustment != null) {
+                    leg.adjustment.target = null;
+                    leg.adjustment.lastUnfilled = 0;
+                    leg.adjustment.waitReason = "";
+                }
                 for (Entry entry : leg.entries) {
+                    entry.resizedByCopySettings = true;
                     entry.remaining = entry.margin = entry.nominalLeft = null;
                     entry.rejectedNotional = entry.rejectedQuantity = entry.reportedMinimum = ZERO;
                 }
@@ -535,6 +580,7 @@ final class FollowBook {
             }
             leg.resetCopyOrders(inFlightEntry);
             LeaderHistory.Holding source = holdings.get(side);
+            leg.deferredAdjustmentSlippage = false;
             leg.adjustment = new CopyAdjustment("adjust-setting|" + side + "|" + copyChangedAt,
                     source == null ? null : source.entryPrice, leaderMargin);
             leg.adjustOnSignal = false;
@@ -655,7 +701,6 @@ final class FollowBook {
         }
     }
 
-    // 缺口内可能已经完成一轮开平。按合约和方向累计留存比例与净变化，再用当前带单均价处理剩余增仓。
     void acceptRecovered(List<Rules.Signal> rows, boolean enqueue, Map<String, Long> detectedAt,
             Map<String, LeaderHistory.Holding> holdings) throws JSONException {
         if (!enqueue) {
@@ -775,6 +820,23 @@ final class FollowBook {
         return result;
     }
 
+    boolean syncLeaderAverages(Map<String, LeaderHistory.Holding> holdings) {
+        boolean updated = !leaderAveragesVerified;
+        leaderAveragesVerified = true;
+        for (Leg leg : legs.values()) {
+            LeaderHistory.Holding holding = holdings.get(key(leg.symbol, leg.isLong));
+            BigDecimal average = holding != null && holding.quantity.signum() > 0
+                    && holding.entryPrice != null && holding.entryPrice.signum() > 0 ? holding.entryPrice : null;
+            if (average == null ? leg.leaderAverage == null
+                    : leg.leaderAverage != null && average.compareTo(leg.leaderAverage) == 0) continue;
+            leg.leaderAverage = average;
+            for (Entry entry : leg.entries) entry.lastUnfilled = 0;
+            if (leg.adjustment != null) leg.adjustment.lastUnfilled = 0;
+            updated = true;
+        }
+        return updated;
+    }
+
     void seedPositions(Map<String, BigDecimal> known) {
         for (String symbol : config.symbols) {
             leg(symbol, true).leader = known.getOrDefault(key(symbol, true), ZERO);
@@ -852,10 +914,10 @@ final class FollowBook {
                 log("已有仓位纳入跟单 · " + signal.symbol + " " + direction + " · "
                         + Rules.show(side.observed) + " " + Rules.base(signal.symbol));
             }
-            boolean waitForRatio = side.adjustment != null;
+            String waitingLabel = side.adjustment == null ? null : side.adjustment.label();
             side.apply(signal, enqueue, strategy, canApplyAdjustment(detectedAt));
-            if (waitForRatio && side.leader.signum() == 0 && enqueue) {
-                log("复制调仓取消 · " + signal.symbol + " " + direction + " · 带单员同方向已平仓");
+            if (waitingLabel != null && side.leader.signum() == 0 && enqueue) {
+                log(waitingLabel + "取消 · " + signal.symbol + " " + direction + " · 带单员同方向已平仓");
             }
             int removed = logCloseCancellations(cancelled, signal, detectedAt);
             if (removed > 0) detail += " · 已取消 " + removed + " 笔等待";
@@ -911,8 +973,8 @@ final class FollowBook {
     boolean cancelWait(String signalId) throws JSONException {
         for (Leg leg : legs.values()) {
             if (leg.adjustment != null && leg.adjustment.id().equals(signalId)) {
+                log("手动取消" + leg.adjustment.label() + " · " + leg.symbol + (leg.isLong ? " 多" : " 空"));
                 leg.clearAdjustment();
-                log("手动取消复制调仓 · " + leg.symbol + (leg.isLong ? " 多" : " 空"));
                 return true;
             }
             java.util.Iterator<Entry> entries = leg.entries.iterator();

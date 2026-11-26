@@ -11,7 +11,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
-/** 通用跟单规则和数值计算，统一开平方向、合约配置、价差和数量精度。 */
 final class Rules {
     static final BigDecimal ZERO = BigDecimal.ZERO;
     static final BigDecimal ONE = BigDecimal.ONE;
@@ -159,16 +158,15 @@ final class Rules {
         throw new IllegalArgumentException("调仓最大不利价差须在 0% 至小于 100% 之间");
     }
 
-    static boolean withinAdversePrice(Action action, BigDecimal reference, BigDecimal percent, BigDecimal price) {
+    private static BigDecimal adversePriceBoundary(Action action, BigDecimal reference, BigDecimal percent) {
         BigDecimal band = percent.movePointLeft(2);
-        BigDecimal boundary = reference.multiply(action.buys() ? ONE.add(band) : ONE.subtract(band));
-        return action.buys() ? price.compareTo(boundary) <= 0 : price.compareTo(boundary) >= 0;
+        return reference.multiply(action.buys() ? ONE.add(band) : ONE.subtract(band));
     }
 
-    /**
-     * 一笔官网成交。保留官网报告的方向，供身份匹配和后续复核。
-     * 同秒同价同量的成交共用指纹，以出现序号区分各笔。补齐余额或成交额时仍可沿用原标识。
-     */
+    static boolean withinAdversePrice(Action action, BigDecimal reference, BigDecimal percent, BigDecimal price) {
+        return !exceedsOpeningLimit(action, price, adversePriceBoundary(action, reference, percent));
+    }
+
     static final class Signal {
         final String symbol;
         final Action action, reportedAction;
@@ -300,15 +298,46 @@ final class Rules {
     static BigDecimal entryLimit(Action action, BigDecimal leaderPrice, BigDecimal percent,
             BigDecimal tick) {
         if (!action.opens) throw new IllegalArgumentException("平仓无开仓限价");
-        BigDecimal band = percent.movePointLeft(2);
-        BigDecimal factor = action.isLong ? ONE.add(band) : ONE.subtract(band);
-        return roundStep(leaderPrice.multiply(factor, MC), tick,
+        return roundStep(adversePriceBoundary(action, leaderPrice, percent), tick,
                 action.isLong ? RoundingMode.FLOOR : RoundingMode.CEILING);
     }
 
+    static boolean exceedsOpeningLimit(Action action, BigDecimal price, BigDecimal limit) {
+        return limit.signum() <= 0 || (action.buys() ? price.compareTo(limit) > 0 : price.compareTo(limit) < 0);
+    }
+
     static boolean acceptable(Action action, BigDecimal limit, Quote quote) {
-        int comparison = quote.execution(action).compareTo(limit);
-        return limit.signum() > 0 && (action.buys() ? comparison <= 0 : comparison >= 0);
+        return !exceedsOpeningLimit(action, quote.execution(action), limit);
+    }
+
+    static boolean favorableOpeningPrice(Action action, BigDecimal price, BigDecimal leaderAverage) {
+        int comparison = price.compareTo(leaderAverage);
+        return action.buys() ? comparison < 0 : comparison > 0;
+    }
+
+    static String openingAverageIssue(Action action, FuturesApi.Position position, BigDecimal quantity,
+            BigDecimal worstPrice, BigDecimal leaderAverage, BigDecimal slippage) {
+        BigDecimal averageLimit = adversePriceBoundary(action, leaderAverage, slippage);
+        BigDecimal held = position.size(action);
+        if (held.signum() == 0) {
+            return exceedsOpeningLimit(action, worstPrice, averageLimit)
+                    ? "带单仓位均价的不利价差超限，继续等待" : "";
+        }
+        BigDecimal entry = position.entryPrice(action);
+        if (entry == null || entry.signum() <= 0) return "等待核对本账户开仓均价";
+        // Compare costs without rounding the projected average at the price boundary.
+        BigDecimal projectedCost = held.multiply(entry).add(quantity.multiply(worstPrice));
+        int comparison = projectedCost.compareTo(held.add(quantity).multiply(averageLimit));
+        if (action.buys() ? comparison <= 0 : comparison >= 0) return "";
+        return "本笔成交后的持仓均价仍超限 · 本账户均价 " + TradeNotice.price(entry)
+                + " · 允许均价" + (action.buys() ? "不高于 " : "不低于 ") + TradeNotice.price(averageLimit);
+    }
+
+    static boolean openingNeedsFullFill(Action action, FuturesApi.Position position,
+            BigDecimal leaderAverage, BigDecimal slippage) {
+        // If the existing average is outside the band, a partial fill may still leave it outside.
+        return position.size(action).signum() > 0 && exceedsOpeningLimit(action, position.entryPrice(action),
+                adversePriceBoundary(action, leaderAverage, slippage));
     }
 
     static BigDecimal iocPrice(Action action, Quote quote, BigDecimal tick) {

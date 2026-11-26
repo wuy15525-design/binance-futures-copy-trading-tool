@@ -18,7 +18,6 @@ import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** 独立保存官网划转记录和读取进度。事件标识用于合并重复翻页，通知状态随事件保存。 */
 final class LeaderBalances extends SQLiteOpenHelper {
     private static final DateTimeFormatter DATE = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss", Locale.ROOT)
             .withResolverStyle(ResolverStyle.STRICT);
@@ -140,7 +139,6 @@ final class LeaderBalances extends SQLiteOpenHelper {
                 ? new BigDecimal(number.replace(",", "")) : null;
     }
 
-    // 分页中断时仍保存已读划转。只有本轮读完才推进上次成功核对时间，避免下一轮跳过未读记录。
     void record(String portfolio, Read read, long now, long followingSince) {
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();

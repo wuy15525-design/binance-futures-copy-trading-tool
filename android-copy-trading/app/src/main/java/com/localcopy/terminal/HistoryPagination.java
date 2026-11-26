@@ -1,9 +1,5 @@
 package com.localcopy.terminal;
 
-/**
- * 把连续 DOM 观测转换为等待、点击、结束或本轮未完成。翻页请求的完成时间由官网决定，
- * 所以用新增旧记录确认翻页，用安静期和加载状态判定末尾，并为行数、耗时和重试设上限。
- */
 final class HistoryPagination {
     enum Step { WAIT, CLICK, END, INCOMPLETE }
 
@@ -35,14 +31,15 @@ final class HistoryPagination {
         next.pages = pages;
         next.clicks = clicks;
         next.nextClick = nextClick;
-        // 保留页数和退避时间。卡页后的这一轮只剩一次点击机会，仍需等待前一次点击稳定。
+        // Give a stalled page one further click per retry. A disappearing button
+        // cannot certify the end while the preceding click is still unconfirmed.
         next.attempts = attempts == 0 ? 0 : 3;
         if (acceptVisibleEnd) next.clickedAt = clickedAt;
         return next;
     }
 
     void manualResume(long now) {
-        // 用户返回应用前可能刚点过「更多」，给这次手动点击留出等待新列表的时间。
+        // The user may have clicked "More" in this document just before returning.
         attempts = Math.max(1, attempts);
         if (acceptVisibleEnd) clickedAt = now;
         nextClick = Math.max(nextClick, now + MIN_CLICK_GAP);
@@ -50,13 +47,17 @@ final class HistoryPagination {
 
     Step observe(int rows, int olderAppended, boolean overlaps, boolean more, boolean ready,
             boolean busy, boolean loading, long now) {
+        return observe(rows, olderAppended, overlaps, more, ready, busy, loading, now, false);
+    }
+
+    Step observe(int rows, int olderAppended, boolean overlaps, boolean more, boolean ready,
+            boolean busy, boolean loading, long now, boolean joinsArchive) {
         if (began < 0) {
             began = now;
             if (pages == 0) pages = 1;
         }
         if (olderAppended > 0 && attempts > 0) advanced(now);
-        if (overlaps && !baseline && !loading && !busy) return Step.END;
-        // 首次建档可接受稳定的可见末尾。补读与独立复核还受各自的重合或目标证据约束。
+        if ((joinsArchive || overlaps && !baseline) && !loading && !busy) return Step.END;
         boolean clickSettled = clickedAt < 0 || now - clickedAt >= PAGE_TIMEOUT;
         if (!more && !busy && !loading && (attempts == 0 || (acceptVisibleEnd && clickSettled && now >= nextClick))) {
             if (endSince < 0) endSince = now;
@@ -69,7 +70,7 @@ final class HistoryPagination {
         }
         int maxAttempts = baseline ? 4 : 3;
         if (busy && attempts > 0) {
-            // 官网繁忙提示可能持续多帧，每次观测都顺延下次点击，给最后一次繁忙留足退避时间。
+            // Start the cooldown at the last busy observation, not when it first appeared.
             nextClick = Math.max(nextClick, now + retryDelay(acceptVisibleEnd ? INITIAL_BUSY_RETRY : RETRY_DELAY));
             clickedAt = -1;
         } else if (clickedAt >= 0 && now - clickedAt >= PAGE_TIMEOUT) {
@@ -111,8 +112,14 @@ final class HistoryPagination {
     boolean inFlight() { return attempts > 0; }
 
     String report(long now, int rows, boolean ended) {
-        String status = (baseline ? "官网基线 " : "断档补页 ") + (rows == 0 ? 0 : pages) + " 页";
-        return status + (ended ? " · " + (baseline ? "已读到末尾" : "已核对") : " · 分页未完成")
+        return report(now, rows, ended, false);
+    }
+
+    String report(long now, int rows, boolean ended, boolean joinedArchive) {
+        String mode = joinedArchive ? "旧档案续接 " : baseline ? "官网基线 " : "断档补页 ";
+        String status = mode + (rows == 0 ? 0 : pages) + " 页";
+        String result = joinedArchive || !baseline ? "已核对重合" : "已读到末尾";
+        return status + (ended ? " · " + result : " · 分页未完成")
                 + " · " + rows + " 笔 · " + clicks
                 + " 次点击 · " + Rules.show(java.math.BigDecimal.valueOf(duration(now), 3)) + " 秒";
     }

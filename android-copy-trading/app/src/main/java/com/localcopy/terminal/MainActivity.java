@@ -64,10 +64,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/**
- * 承载运行、成交和设置页面。界面从服务快照和本机档案取数，通过服务命令控制跟单，
- * 账户查询在后台执行，结果回到主线程刷新。
- */
 public final class MainActivity extends Activity {
     private static final int EXPORT_REQUEST = 44;
     private static final int RECORDS_PER_PAGE = 12;
@@ -402,7 +398,7 @@ public final class MainActivity extends Activity {
         Ui.addButton(websiteHelp, openWebsite);
         retryWebsite = Ui.button(this, "重试官网读取", false, v -> autoCommand(AutoFollowService.RETRY_WEB));
         Ui.addButton(websiteHelp, retryWebsite);
-        websiteHelp.setVisibility(View.GONE);
+        retryWebsite.setVisibility(View.GONE);
         automatic.addView(websiteHelp);
         copyStatus = Ui.text(this, "", 14, Ui.INK);
         copyStatus.setVisibility(View.GONE);
@@ -978,9 +974,12 @@ public final class MainActivity extends Activity {
                 body.addView(Ui.text(this, "沿用原跟单方式，继续处理已有仓位和等待。", 13, Ui.MUTED));
             }
             LinearLayout copyFields = Ui.column(this);
-            EditText factor = copyFactorField(copyFields, previous == null ? Rules.ONE : previous.copyFactor);
+            LinearLayout factorFields = Ui.column(this);
+            EditText factor = copyFactorField(factorFields, previous == null ? Rules.ONE : previous.copyFactor);
+            if (continuing == Rules.Strategy.EXPOSURE) showCopyAdjustmentRisk(factorFields);
+            copyFields.addView(factorFields);
             EditText slippage = copySlippageField(copyFields, previous == null ? LocalData.DEFAULT_SLIPPAGE : previous.copySlippage);
-            if (continuing == Rules.Strategy.EXPOSURE) showCopyAdjustmentRisk(copyFields);
+            copyFields.addView(Ui.text(this, "首次补已有仓位也使用这个点差。", 13, Ui.MUTED));
             body.addView(copyFields);
             TextView settings = Ui.text(this, "", 13, Ui.MUTED);
             body.addView(settings);
@@ -989,7 +988,7 @@ public final class MainActivity extends Activity {
                     : options.getCheckedRadioButtonId() == pointsId ? Rules.Strategy.POINTS : Rules.Strategy.EXPOSURE;
             Runnable update = () -> {
                 Rules.Strategy selected = choice.get();
-                copyFields.setVisibility(selected == Rules.Strategy.EXPOSURE ? View.VISIBLE : View.GONE);
+                factorFields.setVisibility(selected == Rules.Strategy.EXPOSURE ? View.VISIBLE : View.GONE);
                 Ui.setText(settings, strategySettings(config, selected, real));
             };
             options.setOnCheckedChangeListener((group, checked) -> update.run());
@@ -1001,13 +1000,9 @@ public final class MainActivity extends Activity {
                     .setPositiveButton(real ? "下一步" : "启动测试网跟单", null).show();
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
                 Rules.Strategy selected = choice.get();
-                BigDecimal value = Rules.ONE;
-                BigDecimal limit = LocalData.DEFAULT_SLIPPAGE;
-                if (selected == Rules.Strategy.EXPOSURE) {
-                    value = readCopyField(factor, true);
-                    limit = readCopyField(slippage, false);
-                    if (value == null || limit == null) return;
-                }
+                BigDecimal value = selected == Rules.Strategy.EXPOSURE ? readCopyField(factor, true) : Rules.ONE;
+                BigDecimal limit = readCopyField(slippage, false);
+                if (value == null || limit == null) return;
                 dialog.dismiss();
                 if (real) confirmLiveStart(config.portfolio, selected, value, limit);
                 else startAuto(kind, selected, value, limit);
@@ -1156,46 +1151,40 @@ public final class MainActivity extends Activity {
         }
     }
 
-    // 遇到地区提示或建档卡页时，尽量把服务正在使用的 WebView 挂到对话框，保留原网页的分页状态。
     private void openWebsite() {
         FrameLayout prompt = new FrameLayout(this);
+        android.webkit.WebView preview = null;
         try {
             String portfolio = store.config().portfolio;
-            Uri target = Uri.parse(WebsiteCapture.portfolioUrl(portfolio));
-            boolean baseline = store.prefs.getBoolean("auto_baseline_waiting", false)
-                    && store.prefs.getString("auto_web_access", "").isEmpty();
+            boolean accessLimited = !store.prefs.getString("auto_web_access", "").isEmpty();
+            boolean baseline = store.prefs.getBoolean("auto_baseline_waiting", false) && !accessLimited;
             boolean attached = baseline ? WebsiteCapture.attachBaselinePrompt(portfolio, prompt)
                     : WebsiteCapture.attachRegionPrompt(portfolio, prompt);
-            if (!attached) {
-                if (baseline) autoCommand(AutoFollowService.RETRY_WEB);
-                else openInBrowser(target);
-                return;
-            }
+            if (!attached) preview = WebsiteCapture.openPreview(portfolio, prompt);
+            final android.webkit.WebView ownedPreview = preview;
             prompt.setMinimumHeight(Math.max(Ui.dp(this, 240), surface.getHeight() * 2 / 3));
             AlertDialog.Builder builder = new AlertDialog.Builder(this)
-                    .setTitle(baseline ? "在最新操作记录中点「更多」" : "币安官网地区提示")
-                    .setView(prompt).setNegativeButton("返回", null)
-                    .setPositiveButton(baseline ? "核对并继续" : "重试读取", (opened, which) -> {
-                        WebsiteCapture.detachRegionPrompt(prompt);
-                        autoCommand(AutoFollowService.RETRY_WEB);
-                    });
-            if (!baseline) builder.setNeutralButton("用浏览器打开", (opened, which) -> openInBrowser(target));
+                    .setTitle(baseline && attached ? "在最新操作记录中点「更多」" : "币安组合页")
+                    .setView(prompt).setNegativeButton("返回", null);
+            if ((baseline || accessLimited) && AutoFollowService.running()) {
+                builder.setPositiveButton(baseline && attached ? "核对并继续" : "重试读取", (opened, which) -> {
+                    WebsiteCapture.detachRegionPrompt(prompt);
+                    autoCommand(AutoFollowService.RETRY_WEB);
+                });
+            }
             websitePrompt = builder.create();
             websitePrompt.setOnDismissListener(dialog -> {
-                WebsiteCapture.detachRegionPrompt(prompt);
+                if (ownedPreview == null) WebsiteCapture.detachRegionPrompt(prompt);
+                else WebsiteCapture.closePreview(prompt, ownedPreview);
                 websitePrompt = null;
             });
             websitePrompt.show();
         } catch (RuntimeException failure) {
-            WebsiteCapture.detachRegionPrompt(prompt);
+            if (preview == null) WebsiteCapture.detachRegionPrompt(prompt);
+            else WebsiteCapture.closePreview(prompt, preview);
             websitePrompt = null;
             error(failure);
         }
-    }
-
-    private void openInBrowser(Uri target) {
-        try { startActivity(new Intent(Intent.ACTION_VIEW, target)); }
-        catch (RuntimeException failure) { error(failure); }
     }
 
     private void chooseInitialPositions() {
@@ -1221,7 +1210,6 @@ public final class MainActivity extends Activity {
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
     }
 
-    // 用户确认的是所见仓位快照。档案水位或补录笔数变化后，需要按新的预览重新选择。
     private void submitInitialPositions(AutoFollowService.InitialPositions preview, String[] selected) {
         if (!AutoFollowService.running()) return;
         AutoFollowService.InitialPositions latest = displayedInitialPositions;
@@ -1397,10 +1385,9 @@ public final class MainActivity extends Activity {
         String failure = matches ? store.prefs.getString("auto_capture_error", "") : "";
         boolean accessLimited = matches && !store.prefs.getString("auto_web_access", "").isEmpty();
         boolean baselineWaiting = matches && store.prefs.getBoolean("auto_baseline_waiting", false);
-        websiteHelp.setVisibility(accessLimited || baselineWaiting ? View.VISIBLE : View.GONE);
         openWebsite.setText(baselineWaiting && !accessLimited ? "在应用内展开成交" : "打开币安组合页");
-        openWebsite.setEnabled(accessLimited || AutoFollowService.running());
-        retryWebsite.setEnabled((accessLimited || baselineWaiting) && AutoFollowService.running());
+        retryWebsite.setVisibility(accessLimited || baselineWaiting ? View.VISIBLE : View.GONE);
+        retryWebsite.setEnabled(AutoFollowService.running());
         Ui.setDetail(autoView, status + (capture.isEmpty() ? "" : "\n上次有效抓取 " + capture)
                 + (failure.isEmpty() ? "" : "\n上次取数失败 " + failure));
         JSONObject saved = mode.isEmpty() ? null : store.load(AutoFollowService.file(mode));
@@ -1541,6 +1528,7 @@ public final class MainActivity extends Activity {
                     row.price, row.time, true, null));
         }
         if (preview.withoutPrice > 0) details.append("\n有 ").append(preview.withoutPrice).append(" 个方向缺少可核对的开仓均价");
+        if (preview.awaitingReview > 0) details.append("\n有 ").append(preview.awaitingReview).append(" 个方向等待同秒成交核对");
         Ui.setDetail(initialDetails, details.toString());
         initialPositions.renderText(preview.portfolio + "|" + preview.mode, positions, "暂无可补仓位");
     }
@@ -1747,7 +1735,9 @@ public final class MainActivity extends Activity {
                 FollowBook.Entry entry = waiting.get(i);
                 Rules.ContractRule rule = config.rules.getOrDefault(entry.signal.symbol, book.config.rule(entry.signal.symbol));
                 id = entry.id();
-                line = waitDescription(entry, mode, prices, rule.slippagePercent)
+                BigDecimal leaderAverage = book.leg(entry.signal.symbol, entry.signal.action.isLong).leaderAverage;
+                BigDecimal slippage = entry.usesAdjustmentSlippage() ? book.copySlippage : rule.slippagePercent;
+                line = waitDescription(entry, mode, prices, slippage, leaderAverage)
                         + "\n" + waitRequestStatus(entry, book.pending, running, opens, websiteReady, System.currentTimeMillis());
                 if (book.strategy == Rules.Strategy.EXPOSURE) {
                     BigDecimal ratio = entry.signal.exposureRatio();
@@ -1760,7 +1750,7 @@ public final class MainActivity extends Activity {
                 FollowBook.CopyAdjustment adjustment = leg.adjustment;
                 id = adjustment.id();
                 String unit = " " + Rules.base(leg.symbol);
-                line = leg.symbol + (leg.isLong ? " 多" : " 空") + " · 复制调仓 " + Rules.show(book.copyFactor) + "×"
+                line = leg.symbol + (leg.isLong ? " 多" : " 空") + " · " + adjustment.label() + " " + Rules.show(book.copyFactor) + "×"
                         + "\n本账户持仓 " + Rules.show(leg.owned) + unit
                         + " · 目标 " + (adjustment.target == null ? "待核算" : Rules.show(adjustment.target) + unit);
                 if (adjustment.signal != null) {
@@ -1774,22 +1764,35 @@ public final class MainActivity extends Activity {
                         Rules.Action direction = leg.isLong ? Rules.Action.OPEN_LONG : Rules.Action.OPEN_SHORT;
                         boolean settingPrice = adjustment.fromSetting();
                         BigDecimal limit = book.copySlippage;
-                        BigDecimal reference = adjustment.priceReference();
+                        if (!leg.adjustmentUsesCopySlippage() && leg.leaderAverage != null) {
+                            limit = limit.min(config.rules.getOrDefault(leg.symbol, book.config.rule(leg.symbol)).slippagePercent);
+                        }
+                        BigDecimal reference = leg.leaderAverage == null ? adjustment.priceReference() : leg.leaderAverage;
                         line += "\n加仓最大不利价差 " + Rules.show(limit) + "%";
                         if (reference != null) {
-                            line += " · " + (settingPrice ? "参考均价 " : "带单成交价 ") + TradeNotice.price(reference) + " USDT";
+                            String label = leg.leaderAverage != null ? "带单仓位均价 " : settingPrice ? "参考均价 " : "带单成交价 ";
+                            line += " · " + label + TradeNotice.price(reference) + " USDT";
                             long age = System.currentTimeMillis() - prices.time;
                             Rules.Quote quote = mode.equals(prices.mode) && age >= 0 && age <= 10000 ? prices.quotes.get(leg.symbol) : null;
                             if (quote != null) {
                                 BigDecimal price = quote.execution(direction);
-                                line += "\n" + (direction.buys() ? "卖一 " : "买一 ") + TradeNotice.price(price)
-                                        + (Rules.withinAdversePrice(direction, reference, limit, price) ? " · 价格符合" : " · 等待合适价格");
+                                line += "\n" + (direction.buys() ? "卖一 " : "买一 ") + TradeNotice.price(price);
+                                if (leg.leaderAverage != null) {
+                                    line += Rules.favorableOpeningPrice(direction, price, leg.leaderAverage)
+                                            ? " · 报价优于带单均价，仍需核对成交后均价" : " · 下单前核对成交后均价";
+                                } else {
+                                    line += Rules.withinAdversePrice(direction, reference, limit, price)
+                                            ? " · 盘口价差达标" : " · 等待合适价格";
+                                }
                             }
                         } else line += " · 等待参考价";
                     }
                 }
                 if (book.pending != null && id.equals(book.pending.optString("copyAdjustment"))) line += "\n委托待核对";
                 else if (!running) line += "\n等待恢复跟单";
+                else if (book.pending != null) line += "\n等待在途委托核对完成";
+                else if (!websiteReady) line += "\n等待官网成交核对完成";
+                else if (!adjustment.waitReason.isEmpty()) line += "\n状态 · " + adjustment.waitReason;
             }
             descriptions.add(line);
             ids.add(id);
@@ -1816,13 +1819,17 @@ public final class MainActivity extends Activity {
     }
 
     private static String waitDescription(FollowBook.Entry entry, String mode,
-            AutoFollowService.WaitingPrices prices, BigDecimal slippage) {
+            AutoFollowService.WaitingPrices prices, BigDecimal slippage, BigDecimal leaderAverage) {
         Rules.Signal signal = entry.signal;
-        BigDecimal reference = entry.referencePrice();
+        BigDecimal reference = entry.referencePrice(leaderAverage);
         String title = signal.symbol + " " + signal.action.label + (entry.existing ? " · 补已有仓位" : "")
                 + " · " + TradeNotice.time(signal.time)
-                + (entry.recoveryAverage == null ? "\n参考价 " : "\n补页后推算均价 ")
+                + (entry.existing && leaderAverage != null ? "\n带单仓位均价 "
+                        : entry.recoveryAverage == null ? "\n参考价 " : "\n补页后推算均价 ")
                 + TradeNotice.price(reference) + " USDT";
+        if (!entry.existing && leaderAverage != null) {
+            title += " · 带单仓位均价 " + TradeNotice.price(leaderAverage) + " USDT";
+        }
         if (entry.fraction.compareTo(Rules.ONE) < 0) {
             title += " · 剩余跟单意向 " + Rules.show(entry.fraction.movePointRight(2).setScale(2, RoundingMode.HALF_UP)) + "%";
         }
@@ -1840,11 +1847,15 @@ public final class MainActivity extends Activity {
             return title + "\n等待可用盘口" + (matchingMode && !prices.error.isEmpty() ? " · " + prices.error : "");
         }
         BigDecimal current = quote.execution(signal.action);
+        String market = title + "\n" + (signal.action.isLong ? "卖一 " : "买一 ") + Rules.show(current);
+        if (leaderAverage != null) {
+            return market + (Rules.favorableOpeningPrice(signal.action, current, leaderAverage)
+                    ? " · 报价优于带单均价，仍需核对成交后均价" : " · 下单前核对成交后均价");
+        }
         BigDecimal delta = signal.action.isLong ? current.subtract(reference) : reference.subtract(current);
         BigDecimal adverse = delta.max(Rules.ZERO).divide(reference, Rules.MC).movePointRight(2);
-        return title + "\n" + (signal.action.isLong ? "卖一 " : "买一 ") + Rules.show(current)
-                + " · 不利价差 " + Rules.show(adverse.setScale(3, RoundingMode.HALF_UP)) + "% / "
-                + Rules.show(slippage) + "% · " + (adverse.compareTo(slippage) > 0 ? "超限等待" : "价差达标");
+        return market + " · 不利价差 " + Rules.show(adverse.setScale(3, RoundingMode.HALF_UP)) + "% / "
+                + Rules.show(slippage) + "% · " + (adverse.compareTo(slippage) > 0 ? "超限等待" : "盘口价差达标");
     }
 
     static String waitRequestStatus(FollowBook.Entry entry, JSONObject pending, boolean running, boolean opens,
@@ -1862,7 +1873,7 @@ public final class MainActivity extends Activity {
         if (entry.checkFailures > 0 || entry.requestIssue.endsWith("币安请求超时")) {
             return "状态 · 等待下一轮有效信号，自动重试开仓检查";
         }
-        return "状态 · 等待开仓条件满足";
+        return "状态 · " + (entry.waitReason.isEmpty() ? "等待开仓条件满足" : entry.waitReason);
     }
 
     private void cancelWaiting(String mode, String id) {

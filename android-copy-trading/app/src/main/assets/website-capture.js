@@ -1,7 +1,3 @@
-/**
- * 读取当前组合详情的可见 DOM，并把观测交给 Android 端。
- * 官网标签、日历和成交卡片会分批渲染，脚本报告各自的状态，分页节奏和入档判断由 Java 端控制。
- */
 function copyTerminalCapture(request) {
     const path = location.pathname.replace(/\/$/, "");
     if (location.origin !== "https://www.binance.com" || path !== request.path) {
@@ -11,7 +7,6 @@ function copyTerminalCapture(request) {
         }
         return JSON.stringify({ phase: "navigation" });
     }
-    // reload 返回前仍可能读到旧 DOM。给每份文档保留标识，旧文档继续等待导航。
     if (!document.copyTerminalDocument) document.copyTerminalDocument = request.document;
     const id = document.copyTerminalDocument;
     let name = "";
@@ -165,7 +160,6 @@ function copyTerminalCapture(request) {
         });
     }
 
-    // 日期输入框可能晚于成交卡片出现，窄屏也可能用单个按钮显示范围。保留缺失状态给 Java 端判断。
     const readDates = value => Array.from((value || "").normalize("NFKC").matchAll(
         /(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})(?!\d)/g),
         ([, year, month, day]) => `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`);
@@ -191,7 +185,6 @@ function copyTerminalCapture(request) {
         return rendered(node) && (moreLabel.test(text) || moreLabel.test(accessible)
             || (/^(?:展开|展開)$/.test(text || accessible) && node.closest(".LatestRecords")));
     });
-    // 观察按钮是否存在、能否点击，以及页面是否繁忙。按钮暂时消失时，Java 端仍会等待列表稳定。
     const moreReady = !!more && !more.disabled && more.getAttribute("aria-disabled") !== "true"
         && !/(?:^|\s)(?:\S+-)?(?:disabled|loading)(?=\s|$)/.test(more.className || "");
     const pageFailure = /系统繁忙|系統繁忙|展开失败|展開失敗|加载失败|載入失敗|System(?:\s*is)?\s*busy|Failed\s*to\s*load/i;
@@ -204,7 +197,6 @@ function copyTerminalCapture(request) {
         || Array.from(pane.querySelectorAll('[role="progressbar"],[aria-busy="true"]')).some(rendered);
     const rangePopups = () => Array.from(document.querySelectorAll(".bn-web-datepicker-dropdown-range")).filter(rendered);
 
-    // 部分官网日历先更新输入框，再等用户确认才刷新列表。存在确认按钮时报告仍在应用日期范围。
     if (request.applyDates && dates.length === 2
             && dates.every((date, index) => date === request.applyDates[index])) {
         const popups = rangePopups();
@@ -271,7 +263,7 @@ function copyTerminalCapture(request) {
         .map(timeline => Array.from(timeline.querySelectorAll(":scope > .item")).filter(rendered).map(row => row.innerText.trim()))
         .filter(rows => rows.length > 0).sort((a, b) => b.length - a.length);
     const rows = candidates[0];
-    // 响应式切换时宽屏和窄屏时间线可能并存。只读取一份，内容对不上时等待布局和记录稳定。
+    // The desktop and mobile pane can briefly coexist while WebView changes width.
     if (rows && candidates.slice(1).some(other => !other.every((row, i) => row === rows[i]))) {
         return answer("list", { dates, datePicker, zone, more: !!more, moreReady, busy, loading: true });
     }

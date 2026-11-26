@@ -9,10 +9,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * 用已平仓历史或已核对仓位，把官网只写「做多／做空」的记录推断为开仓或平仓。
- * 证据不足或单笔跨过零仓位时，保留原始买卖方向供后续核对。
- */
 final class OneWayTrades {
     private OneWayTrades() {}
 

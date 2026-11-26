@@ -31,6 +31,22 @@ public final class AutomaticTests {
             s.tick();
             require(s.api.submissions == 1);
         });
+        test("同秒笔数待核对只暂缓该方向，核实后才执行等待委托", () -> {
+            String eth = "ETHUSDT";
+            Scenario s = new Scenario(false, Set.of(BTC, eth));
+            s.api.bySymbol.put(eth, new FuturesApi.Position());
+            s.book.acceptNew(List.of(signal(OPEN_LONG, 1, "10"),
+                    new Rules.Signal(eth, OPEN_LONG, TIME + 2000, d("100"), d("10"))), true);
+            s.execution.holdTradeReviews(Set.of(BTC + "|LONG"));
+            s.tick();
+            require(s.api.submissions == 1);
+            equal(ZERO, s.book.leg(BTC, true).owned);
+            equal(d("1"), s.book.leg(eth, true).owned);
+            s.execution.holdTradeReviews(Set.of());
+            s.tick();
+            require(s.api.submissions == 2);
+            equal(d("1"), s.book.leg(BTC, true).owned);
+        });
         test("空页、漏页和重叠记录修改均保留现有仓位与水位", () -> {
             Scenario s = new Scenario(false);
             Rules.Signal old = signal(CLOSE_LONG, 1, "2");
@@ -579,6 +595,8 @@ public final class AutomaticTests {
             s.book.notice = new JSONObject().put("id", "legacy").put("text", "开多遭拒单 · 旧错误通知");
             s.execution.flushNotice();
             require(s.events.isEmpty() && s.book.notice == null);
+            require(s.tick().contains("已确认未成交") && s.events.isEmpty());
+            s.book.waits().get(0).lastUnfilled -= 6000;
             s.tick();
             require(s.events.size() == 1 && s.events.get(0).contains("已成交"));
         });
@@ -1073,6 +1091,8 @@ public final class AutomaticTests {
             s.tick();
             equal(d("4"), s.api.position.shorts);
             equal(d("4"), s.book.leg(BTC, false).copied);
+            require(s.archivedFills.get(0).startsWith("复制调仓 补空"));
+            require(s.book.log.toString().contains("复制调仓 补空"));
         });
         test("降系数后等待余额时带单员加仓，得到余额后按新目标市价减仓", () -> {
             Scenario s = exposure();
@@ -1381,7 +1401,7 @@ public final class AutomaticTests {
             equal(d("8"), s.api.position.longs);
             require(s.api.lastLimit == null && s.api.submissions == 2);
         });
-        test("带单成交触发的调仓使用当前复制点差，普通开仓仍用合约点差", () -> {
+        test("同批带单成交合并跟单按复制点差检查，成交仍显示开仓", () -> {
             Scenario s = exposure();
             s.book.copyFactor = d("0.1");
             s.book.copySlippage = d("0.1");
@@ -1389,14 +1409,378 @@ public final class AutomaticTests {
                     exposureSignal(OPEN_LONG, 2, "0.4", "40", "1000")), true);
             s.api.price = d("100.2");
             require(s.tick().contains("同批后续") && s.api.submissions == 0);
-            require(s.tick().contains("超出调仓不利价差 0.1%") && s.api.submissions == 0);
+            require(s.tick().contains("超出跟单不利价差 0.1%") && s.api.submissions == 0);
             s.book.changeCopySettings(d("0.1"), d("0.6"), TIME + 3000, java.util.Map.of(), d("1000"));
             require(!s.book.copyReplanPending);
             s.api.price = d("100.4");
+            s.api.loseResponse = true;
+            s.tick();
+            s.saved.getJSONObject("pending").remove("copyRebalance");
+            s.restart();
             s.tick();
             equal(d("0.06"), s.api.position.longs);
             equal(d("100.6"), s.api.lastLimit);
             require(s.api.submissions == 1);
+            require(s.archivedFills.get(0).startsWith("开多"));
+            require(s.book.log.getString(s.book.log.length() - 1).equals(s.archivedFills.get(0)));
+        });
+        test("盘口只能分批时，按本笔 IOC 核对可用保证金，剩余金额留待下轮", () -> {
+            Scenario s = exposure();
+            s.api.depth = d("1");
+            s.api.available = d("21");
+            s.book.apply(exposureSignal(OPEN_LONG, 1, "4", "400", "1000"), true);
+            s.tick();
+            equal(d("1"), s.api.position.longs);
+            equal(d("300"), s.book.waits().get(0).nominalLeft);
+
+            s.api.available = d("1");
+            s.tick();
+            require(s.api.submissions == 1);
+            require(s.book.waits().get(0).waitReason.contains("可用保证金不足"));
+            s.restart();
+            require(s.book.waits().get(0).waitReason.contains("可用保证金不足"));
+            s.api.depth = d("3");
+            s.api.available = d("61");
+            s.tick();
+            equal(d("4"), s.api.position.longs);
+            require(s.book.waits().isEmpty());
+            require(s.archivedFills.get(1).startsWith("加多"));
+        });
+        test("确认 IOC 零成交后让下一笔先执行，重启后仍按新盘口重试", () -> {
+            Scenario s = exposure();
+            Rules.Signal first = exposureSignal(OPEN_LONG, 1, "1", "100", "1000");
+            s.book.apply(first, true);
+            s.book.apply(exposureSignal(OPEN_LONG, 2, "1", "100", "1000"), true);
+            s.api.partial = ZERO;
+            s.tick();
+            require(s.api.submissions == 1 && s.book.pending == null && s.archivedFills.isEmpty());
+            s.restart();
+            require(s.book.waits().get(0).waitReason.contains("已确认未成交"));
+            s.tick();
+            equal(d("1"), s.api.position.longs);
+            require(s.book.waits().size() == 1 && s.book.waits().get(0).id().equals(first.id));
+            s.book.waits().get(0).lastUnfilled -= 6000;
+            s.api.price = d("99");
+            s.tick();
+            equal(d("2.01"), s.api.position.longs);
+            equal(d("99"), s.api.lastLimit);
+            require(s.api.submissions == 3 && new java.util.HashSet<>(s.api.usedIds).size() == 3);
+        });
+        test("独立调仓检查使用币安已返回的杠杆上限", () -> {
+            var config = new Rules.Config(LocalData.DEFAULT_PORTFOLIO, Set.of(BTC), false, d("20"), 20, BAND);
+            Scenario s = new Scenario(config, Rules.Strategy.EXPOSURE);
+            FollowBook.Leg leg = s.book.leg(BTC, true);
+            leg.leader = leg.copied = d("2");
+            leg.managed = true;
+            leg.adjustment = new FollowBook.CopyAdjustment(exposureSignal(OPEN_LONG, 1, "2", "200", "1000"));
+            s.api.rejectedLeverageCap = 10;
+            var ready = new java.util.concurrent.Semaphore(0);
+            s.execution.prepareCopyAdjustmentsWith(() -> new Venue() {
+                @Override public int currentLeverage(String symbol) { return s.api.leverage; }
+            }, ready::release);
+            try {
+                s.tick();
+                require(ready.tryAcquire(2, java.util.concurrent.TimeUnit.SECONDS));
+                require(s.execution.finishReadyCopyAdjustments(config, () -> true, () -> true)
+                        .message.contains("币安限制为 10 倍"));
+                s.tick();
+                require(ready.tryAcquire(2, java.util.concurrent.TimeUnit.SECONDS));
+                require(s.execution.finishReadyCopyAdjustments(config, () -> true, () -> true)
+                        .message.contains("杠杆已确认 10 倍"));
+                s.tick();
+                require(ready.tryAcquire(2, java.util.concurrent.TimeUnit.SECONDS));
+                s.execution.finishReadyCopyAdjustments(config, () -> true, () -> true);
+                equal(d("2"), s.api.position.longs);
+                require(s.api.submissions == 1 && s.api.leverageChanges == 1);
+            } finally {
+                s.execution.closeCopyChecks();
+            }
+        });
+        test("多空、两种策略和两种启动选项都按最新带单均价限制开仓", () -> {
+            for (Rules.Strategy strategy : Rules.Strategy.values()) {
+                for (Rules.Action direction : List.of(OPEN_LONG, OPEN_SHORT)) {
+                    for (boolean backfill : List.of(false, true)) {
+                        var config = new Rules.Config(LocalData.DEFAULT_PORTFOLIO, Set.of(BTC), false, d("30"), 5, BAND);
+                        Scenario s = new Scenario(config, strategy);
+                        String historical = direction.isLong ? "140" : "160";
+                        String addedPrice = direction.isLong ? "180" : "120";
+                        Rules.Signal initial = sizedSignal(direction, 1, "15", historical);
+                        s.book.seedPositions(java.util.Map.of(initial.leg(), initial.quantity));
+                        require(s.book.finishInitialChoice(backfill ? List.of(initial) : List.of()) == (backfill ? 1 : 0));
+                        s.book.syncLeaderAverages(java.util.Map.of(initial.leg(),
+                                new LeaderHistory.Holding(initial.quantity, initial.price, initial.time)));
+                        s.api.price = d(addedPrice);
+                        s.tick();
+                        require(s.api.submissions == 0);
+                        s.book.acceptNew(List.of(sizedSignal(direction, 2, "5", addedPrice)), true);
+                        s.book.syncLeaderAverages(java.util.Map.of(initial.leg(),
+                                new LeaderHistory.Holding(d("20"), d("150"), TIME + 2000)));
+                        require(s.tick().contains("带单仓位均价的不利价差超限") && s.api.submissions == 0);
+                        s.restart();
+                        equal(d("150"), s.book.leg(BTC, direction.isLong).leaderAverage);
+
+                        s.api.price = d("150");
+                        s.tick();
+                        if (backfill) s.tick();
+                        BigDecimal expected = d(backfill ? "20" : direction.isLong ? "6" : "4");
+                        if (strategy == Rules.Strategy.POINTS) expected = d(backfill ? "2" : "1");
+                        equal(expected, s.api.position.size(direction));
+                        equal(d("150"), s.api.position.entryPrice(direction));
+                        require(s.api.submissions == (backfill ? 2 : 1) && s.book.waits().isEmpty());
+                        require(s.archivedFills.get(0).contains("带单仓位均价 150 USDT"));
+                    }
+                }
+            }
+        });
+        test("复制尾单小于门槛时可以合并补差，限价继续采用加仓后的带单仓位均价", () -> {
+            Scenario s = exposure();
+            Rules.Signal initial = sizedSignal(OPEN_SHORT, 1, "0.02", "200");
+            s.book.seedPositions(java.util.Map.of(initial.leg(), initial.quantity));
+            s.book.finishInitialChoice(List.of(initial));
+            s.book.syncLeaderAverages(java.util.Map.of(initial.leg(),
+                    new LeaderHistory.Holding(initial.quantity, initial.price, initial.time)));
+            s.api.price = d("200");
+            require(s.tick().contains("低于最小委托金额") && s.api.submissions == 0);
+            require(s.book.leg(BTC, false).adjustOnSignal);
+
+            Rules.Signal add = sizedSignal(OPEN_SHORT, 2, "1", "100");
+            s.book.acceptNew(List.of(add), true);
+            s.book.syncLeaderAverages(java.util.Map.of(add.leg(),
+                    new LeaderHistory.Holding(d("1.02"), d("101.96078431"), add.time)));
+            s.api.price = d("100");
+            require(s.tick().contains("带单仓位均价") && s.api.submissions == 0);
+            s.restart();
+            s.api.price = d("102");
+            s.tick();
+            equal(d("102"), s.api.lastLimit);
+            equal(d("1.02"), s.api.position.shorts);
+            require(s.api.submissions == 1);
+        });
+        test("初次补仓部分成交后，重新定价只补剩余名义金额，原委托继续按号核对", () -> {
+            Scenario s = exposure();
+            Rules.Signal initial = sizedSignal(OPEN_SHORT, 1, "15", "160");
+            s.book.seedPositions(java.util.Map.of(initial.leg(), initial.quantity));
+            s.book.finishInitialChoice(List.of(initial));
+            s.book.syncLeaderAverages(java.util.Map.of(initial.leg(),
+                    new LeaderHistory.Holding(initial.quantity, initial.price, initial.time)));
+            s.api.price = d("160");
+            s.api.partial = d("7.5");
+            s.api.loseResponse = true;
+            require(s.tick().contains("发送结果未确认"));
+            s.restart();
+            require(s.tick().contains("部分成交") && s.api.submissions == 1);
+            equal(d("1200"), s.book.waits().get(0).nominalLeft);
+
+            Rules.Signal add = sizedSignal(OPEN_SHORT, 2, "5", "120");
+            s.book.acceptNew(List.of(add), true);
+            s.book.syncLeaderAverages(java.util.Map.of(add.leg(),
+                    new LeaderHistory.Holding(d("20"), d("150"), add.time)));
+            s.api.price = d("120");
+            require(s.tick().contains("成交后的持仓均价仍超限") && s.api.submissions == 1);
+            s.api.price = d("150");
+            s.tick();
+            equal(d("8"), s.api.lastQuantity);
+            s.tick();
+            equal(d("4"), s.api.lastQuantity);
+            equal(d("19.5"), s.api.position.shorts);
+            require(s.api.submissions == 3 && s.book.waits().isEmpty());
+        });
+        test("盘口达标仍核对成交后的持仓均价，本账户均价缺失时等待", () -> {
+            for (Rules.Strategy strategy : Rules.Strategy.values()) {
+                Scenario s = new Scenario(exposure().book.config, strategy);
+                Rules.Signal add = sizedSignal(OPEN_SHORT, 1, "2", "150");
+                s.book.finishInitialChoice(List.of());
+                s.book.acceptNew(List.of(add), true);
+                s.book.syncLeaderAverages(java.util.Map.of(add.leg(),
+                        new LeaderHistory.Holding(add.quantity, add.price, add.time)));
+                s.api.position.shorts = d("1");
+                s.api.price = d("150");
+                require(s.tick().contains("等待核对本账户开仓均价") && s.api.submissions == 0);
+                s.api.position.shortEntry = d("135");
+                require(s.tick().contains("成交后的持仓均价仍超限") && s.api.submissions == 0);
+                s.api.price = d("185");
+                s.tick();
+                require(s.api.submissions == 1 && s.api.position.shortEntry.compareTo(d("149.55")) >= 0);
+            }
+        });
+        test("当前均价在点差边界或优于带单均价时，有利价增仓可以部分成交", () -> {
+            for (Rules.Strategy strategy : Rules.Strategy.values()) {
+                for (Rules.Action direction : List.of(OPEN_LONG, OPEN_SHORT)) {
+                    for (boolean atLimit : List.of(true, false)) {
+                        Scenario s = new Scenario(exposure().book.config, strategy);
+                        Rules.Signal add = sizedSignal(direction, 1, "2", direction.isLong ? "90" : "110");
+                        s.book.finishInitialChoice(List.of());
+                        s.book.acceptNew(List.of(add), true);
+                        s.book.syncLeaderAverages(java.util.Map.of(add.leg(),
+                                new LeaderHistory.Holding(d("10"), d("100"), add.time)));
+                        if (direction.isLong) {
+                            s.api.position.longs = d("10");
+                            s.api.position.longEntry = d(atLimit ? "100.3" : "99");
+                        } else {
+                            s.api.position.shorts = d("10");
+                            s.api.position.shortEntry = d(atLimit ? "99.7" : "101");
+                        }
+                        s.api.price = d(direction.isLong ? "98" : "102");
+                        s.api.partial = d("0.1");
+                        require(s.tick().contains("部分成交") && s.api.submissions == 1 && !s.api.lastFullFill);
+                        equal(d("10.1"), s.api.position.size(direction));
+                        require(Rules.withinAdversePrice(direction, d("100"), BAND, s.api.position.entryPrice(direction)));
+                    }
+                }
+            }
+        });
+        test("有利报价仍核对合并均价，只有整笔成交能回到范围时用 FOK", () -> {
+            for (Rules.Strategy strategy : Rules.Strategy.values()) {
+                for (Rules.Action direction : List.of(OPEN_LONG, OPEN_SHORT)) {
+                    Scenario s = new Scenario(exposure().book.config, strategy);
+                    Rules.Signal add = sizedSignal(direction, 1, "2", direction.isLong ? "90" : "110");
+                    s.book.finishInitialChoice(List.of());
+                    s.book.acceptNew(List.of(add), true);
+                    s.book.syncLeaderAverages(java.util.Map.of(add.leg(),
+                            new LeaderHistory.Holding(d("10"), d("100"), add.time)));
+                    BigDecimal previousAverage = d(direction.isLong ? "120" : "80");
+                    if (direction.isLong) {
+                        s.api.position.longs = d("10");
+                        s.api.position.longEntry = previousAverage;
+                    } else {
+                        s.api.position.shorts = d("10");
+                        s.api.position.shortEntry = previousAverage;
+                    }
+                    BigDecimal favorable = d(direction.isLong ? "98" : "102");
+                    s.api.price = favorable;
+                    require(s.tick().contains("成交后的持仓均价仍超限") && s.api.submissions == 0);
+                    if (direction.isLong) s.api.position.longEntry = d("100.5");
+                    else s.api.position.shortEntry = d("99.5");
+
+                    s.api.partial = d("0.01");
+                    require(s.tick().contains("盘口未能整笔成交") && s.api.lastFullFill);
+                    require(s.api.submissions == 1 && s.book.pending == null);
+                    equal(d("10"), s.api.position.size(direction));
+                    s.restart();
+                    require(s.tick().contains("盘口未能整笔成交") && s.api.submissions == 1);
+                    s.book.waits().get(0).lastUnfilled -= 6000;
+
+                    s.api.loseResponse = true;
+                    require(s.tick().contains("发送结果未确认"));
+                    require(s.api.lastFullFill && s.book.pending.getBoolean("fullFill"));
+                    s.restart();
+                    s.tick();
+                    equal(favorable, s.api.lastLimit);
+                    BigDecimal budget = strategy == Rules.Strategy.POINTS ? d("100") : add.turnover;
+                    equal(Rules.floor(budget.divide(favorable, Rules.MC), d("0.001")), s.api.lastQuantity);
+                    equal(d("10").add(s.api.lastQuantity), s.api.position.size(direction));
+                    require(Rules.withinAdversePrice(direction, d("100"), BAND, s.api.position.entryPrice(direction)));
+                    require(s.api.submissions == 2 && s.archivedFills.size() == 1);
+                }
+            }
+        });
+        test("单笔价格稍差时只按成交后的持仓均价拦截", () -> {
+            for (Rules.Strategy strategy : Rules.Strategy.values()) {
+                Scenario s = new Scenario(exposure().book.config, strategy);
+                Rules.Signal add = sizedSignal(OPEN_LONG, 1, "1", "100");
+                s.book.finishInitialChoice(List.of());
+                s.book.acceptNew(List.of(add), true);
+                s.book.syncLeaderAverages(java.util.Map.of(add.leg(),
+                        new LeaderHistory.Holding(d("10"), d("100"), add.time)));
+                s.api.position.longs = d("2");
+                s.api.position.longEntry = d("98");
+                s.api.price = d("110");
+                require(s.tick().contains("成交后的持仓均价仍超限") && s.api.submissions == 0);
+                s.api.price = d("101");
+                s.tick();
+                equal(d("101"), s.api.lastLimit);
+                require(s.api.submissions == 1 && s.api.position.longEntry.compareTo(d("100.3")) <= 0);
+            }
+        });
+        test("调高复制系数时有利报价可补到目标，不受旧调仓参考价拦截", () -> {
+            Scenario s = exposure();
+            Rules.Signal open = sizedSignal(OPEN_SHORT, 1, "10", "110");
+            s.book.apply(open, true);
+            s.api.price = d("110");
+            s.tick();
+            equal(d("10"), s.api.position.shorts);
+            s.book.changeCopySettings(d("1.5"), BAND, TIME + 2000, java.util.Map.of(), d("1000"));
+            s.book.leg(BTC, false).adjustment.reference = d("110");
+            s.book.syncLeaderAverages(java.util.Map.of(open.leg(),
+                    new LeaderHistory.Holding(d("10"), d("100"), open.time)));
+            s.api.price = d("102");
+            s.tick();
+            equal(d("15"), s.api.position.shorts);
+            equal(d("102"), s.api.lastLimit);
+            require(s.api.submissions == 2 && s.archivedFills.get(1).startsWith("复制调仓"));
+        });
+        test("首次补仓在两种策略都使用调仓点差，普通新增仍按合约点差", () -> {
+            for (Rules.Strategy strategy : Rules.Strategy.values()) {
+                for (boolean backfill : List.of(true, false)) {
+                    Scenario s = new Scenario(exposure().book.config, strategy);
+                    s.book.copySlippage = d("1");
+                    Rules.Signal open = sizedSignal(OPEN_LONG, 1, "8", "100");
+                    if (backfill) {
+                        s.book.seedPositions(java.util.Map.of(open.leg(), open.quantity));
+                        s.book.finishInitialChoice(List.of(open));
+                    } else {
+                        s.book.finishInitialChoice(List.of());
+                        s.book.acceptNew(List.of(open), true);
+                    }
+                    s.book.syncLeaderAverages(java.util.Map.of(open.leg(),
+                            new LeaderHistory.Holding(open.quantity, open.price, open.time)));
+                    s.execution.commit();
+                    s.restart();
+                    s.api.price = d("100.8");
+                    s.tick();
+                    require(s.api.submissions == (backfill ? 1 : 0));
+                    require(!s.api.lastFullFill);
+                }
+            }
+        });
+        test("首次补仓小额并入后续委托，重启后保留调仓点差", () -> {
+            Scenario s = exposure();
+            s.book.copySlippage = d("1");
+            Rules.Signal initial = sizedSignal(OPEN_LONG, 1, "0.02", "100");
+            s.book.seedPositions(java.util.Map.of(initial.leg(), initial.quantity));
+            s.book.finishInitialChoice(List.of(initial));
+            s.book.syncLeaderAverages(java.util.Map.of(initial.leg(),
+                    new LeaderHistory.Holding(initial.quantity, initial.price, initial.time)));
+            require(s.tick().contains("低于最小委托金额"));
+            s.restart();
+            Rules.Signal add = sizedSignal(OPEN_LONG, 2, "1", "100");
+            s.book.acceptNew(List.of(add), true);
+            s.api.price = d("100.8");
+            s.tick();
+            equal(d("1.02"), s.api.position.longs);
+            require(s.api.submissions == 1);
+        });
+        test("调高系数使用调仓点差，仓位已有超限时仅允许能拉回范围的整笔成交", () -> {
+            Scenario s = exposure();
+            Rules.Signal open = sizedSignal(OPEN_SHORT, 1, "10", "100");
+            s.book.apply(open, true);
+            s.tick();
+            equal(d("10"), s.api.position.shorts);
+            s.book.syncLeaderAverages(java.util.Map.of(open.leg(),
+                    new LeaderHistory.Holding(open.quantity, open.price, open.time)));
+            s.api.position.shortEntry = d("98.8");
+            s.book.changeCopySettings(d("2"), d("1"), TIME + 2000, java.util.Map.of(), d("1000"));
+            s.api.price = d("99.1");
+            require(s.tick().contains("成交后的持仓均价仍超限") && s.api.submissions == 1);
+            s.api.price = d("99.4");
+            s.tick();
+            equal(d("20"), s.api.position.shorts);
+            equal(d("99.1"), s.api.position.shortEntry);
+            require(s.api.lastFullFill && s.api.submissions == 2);
+        });
+        test("带单均价未核对时暂停增仓，并保留已有仓位平仓能力", () -> {
+            Scenario s = exposure();
+            Rules.Signal add = sizedSignal(OPEN_LONG, 1, "5", "100");
+            s.api.position.longs = d("1");
+            s.api.position.longEntry = d("100");
+            s.book.finishInitialChoice(List.of());
+            s.book.acceptNew(List.of(add), true);
+            s.book.syncLeaderAverages(java.util.Map.of());
+            require(s.tick().contains("等待核对带单仓位均价") && s.api.submissions == 0);
+            s.book.acceptNew(List.of(signal(CLOSE_LONG, 2, "5")), true);
+            s.tick();
+            equal(ZERO, s.api.position.longs);
+            require(s.api.submissions == 1 && s.api.lastLimit == null && s.book.waits().isEmpty());
         });
         test("慢合约仓位核对期间，另外两个合约可先计算并调仓", () -> {
             String slow = BTC;
@@ -1435,7 +1819,7 @@ public final class AutomaticTests {
                     return base;
                 }
                 @Override public void submit(String symbol, Rules.Action action, boolean hedge, BigDecimal qty,
-                        BigDecimal limit, String id) { throw new AssertionError("调仓检查线程发送了委托"); }
+                        BigDecimal limit, String id, boolean fullFill) { throw new AssertionError("调仓检查线程发送了委托"); }
             }, prepared::countDown);
             try {
                 s.tick();
@@ -1466,6 +1850,7 @@ public final class AutomaticTests {
 
     private static final class Scenario {
         final List<String> events = new ArrayList<>();
+        final List<String> archivedFills = new ArrayList<>();
         final Venue api = new Venue();
         FollowBook book;
         FollowExecutor execution;
@@ -1497,7 +1882,8 @@ public final class AutomaticTests {
                 if (failSave) throw new java.io.IOException("disk");
                 saved = new JSONObject(book.json().toString());
                 savedHook.run();
-            }, (id, message, sound) -> events.add(message), id -> !cancelledIds.contains(id));
+            }, (id, message, sound) -> events.add(message), id -> !cancelledIds.contains(id),
+                    (id, time, message) -> archivedFills.add(message), "带单员成交均价");
         }
 
         void restart() throws Exception { book = FollowBook.restore(saved); wire(); }
@@ -1513,7 +1899,7 @@ public final class AutomaticTests {
         BigDecimal price = d("100"), depth = d("100"), available = d("1000"), partial, lastQuantity, lastLimit, realizedPnl;
         BigDecimal copyEquity = d("1000");
         int walletReads, copyReads, walletTimeouts;
-        boolean hedge, loseResponse, hideOrderOnce, reject, neverSent;
+        boolean hedge, loseResponse, hideOrderOnce, reject, neverSent, lastFullFill;
         int submissions, leverage = 5, leverageChanges;
         int rejectedLeverageCap, observedLeverageCap = 125;
         List<FuturesApi.LeverageBracket> brackets = List.of(new FuturesApi.LeverageBracket(125, d("100000")));
@@ -1568,8 +1954,9 @@ public final class AutomaticTests {
             return leverage;
         }
         @Override public void submit(String symbol, Rules.Action action, boolean dual, BigDecimal amount,
-                BigDecimal limit, String id) throws Exception {
+                BigDecimal limit, String id, boolean fullFill) throws Exception {
             beforePost.run();
+            lastFullFill = fullFill;
             if (neverSent) { neverSent = false; throw new FuturesApi.NotSent("signed preflight", null); }
             submissions++;
             lastId = id;
@@ -1584,9 +1971,18 @@ public final class AutomaticTests {
             if (reject) { reject = false; throw new FuturesApi.Failure(400, -2019, "Margin is insufficient."); }
             BigDecimal filled = partial == null ? amount : partial;
             partial = null;
+            if (fullFill && filled.compareTo(amount) != 0) throw new FuturesApi.Failure(400, -5021);
             require(amount.signum() > 0 && amount.compareTo(filled) >= 0 && dual == hedge);
             BigDecimal signed = action.opens ? filled : filled.negate();
             FuturesApi.Position position = position(symbol);
+            BigDecimal held = position.size(action);
+            if (action.opens && filled.signum() > 0) {
+                BigDecimal entry = position.entryPrice(action);
+                BigDecimal average = held.signum() == 0 || entry == null ? price
+                        : held.multiply(entry).add(filled.multiply(price)).divide(held.add(filled), Rules.MC);
+                if (action.isLong) position.longEntry = average;
+                else position.shortEntry = average;
+            }
             if (action.isLong) position.longs = position.longs.add(signed);
             else position.shorts = position.shorts.add(signed);
             require(position.longs.signum() >= 0 && position.shorts.signum() >= 0);
@@ -1621,6 +2017,11 @@ public final class AutomaticTests {
         return new Rules.Signal(BTC, action, TIME + n * 1000, d("100"), d(quantity), null,
                 turnover == null ? null : d(turnover), balance == null ? null : d(balance));
     }
+    private static Rules.Signal sizedSignal(Rules.Action action, int n, String quantity, String price) {
+        return new Rules.Signal(BTC, action, TIME + n * 1000, d(price), d(quantity), null,
+                d(quantity).multiply(d(price)), d("1000"));
+    }
+
     private static void expectBlocked(Check check, String reason) throws Exception {
         try { check.run(); }
         catch (IllegalStateException expected) {

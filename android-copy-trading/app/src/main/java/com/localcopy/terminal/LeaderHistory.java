@@ -10,10 +10,6 @@ import java.util.Set;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/**
- * 在内存中核对网页窗口的连续性，并按成交顺序重放带单仓位。输入按时间从早到晚排列，
- * 同秒顺序和笔数由官网快照提供，档案重读时尽量沿用已匹配成交的标识。
- */
 final class LeaderHistory {
     private static final BigDecimal COST_TOLERANCE = new BigDecimal("0.0005");
     private static final BigDecimal SIZE_TOLERANCE = new BigDecimal("0.0001");
@@ -56,7 +52,6 @@ final class LeaderHistory {
         }
     }
 
-    // 「更多」后的列表必须按顺序包含先前已读记录。只多出最新成交时，仍然无法证明旧页向前推进。
     static int pageGrowth(List<Rules.Signal> retained, List<Rules.Signal> expanded) {
         int matched = 0;
         long latest = retained.get(retained.size() - 1).time;
@@ -90,7 +85,6 @@ final class LeaderHistory {
         return joined;
     }
 
-    // 重读可能只显示部分同秒成交。对齐顺序后，先保留笔数有争议的原样本，等独立复核确定实际笔数。
     static List<Rules.Signal> reconcileBaselineOverlap(List<Rules.Signal> known, List<Rules.Signal> reread) {
         if (known.isEmpty() || reread.isEmpty()) throw new Gap();
         Map<Long, List<Rules.Signal>> uncertain = new HashMap<>();
@@ -118,10 +112,6 @@ final class LeaderHistory {
         return recorded == null || visible == null || recorded.compareTo(visible) == 0;
     }
 
-    /**
-     * 用重合记录接上档案末尾。只在窗口边缘允许同秒记录因分页截断，窗口内部逐秒核对。
-     * 对齐后为新增记录分配出现序号，并把前补历史与水位之后的新增成交分别交给存储层。
-     */
     static Merge merge(List<Rules.Signal> previous, List<Rules.Signal> rows, boolean expanded, boolean legacyOrder) {
         verify(rows);
         List<Rules.Signal> aligned = new ArrayList<>(rows);

@@ -3,7 +3,6 @@ package com.localcopy.terminal;
 final class TradeCsv {
     private TradeCsv() {}
 
-    // 按 CSV 规则转义引号，并让可能被表格软件当成公式的文本按原样显示，保留有符号数值。
     static String line(String... fields) {
         StringBuilder output = new StringBuilder();
         for (String field : fields) {

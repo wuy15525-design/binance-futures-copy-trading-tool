@@ -7,7 +7,6 @@ import android.content.pm.SigningInfo;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 
-/** 发布构建在开启交易相关功能前核对安装包签名，校验值来自构建配置。 */
 final class ReleaseIntegrity {
     static void requireTrustedPackage(Context context) {
         String expected = BuildConfig.RELEASE_CERT_SHA256;

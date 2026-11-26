@@ -31,10 +31,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONObject;
 
-/**
- * Android 前台服务，负责轮询官网、维护档案、恢复跟单账本并调度账户查询和执行。
- * 行情、仓位、钱包和官网余额各有查询线程。跟单账本的状态变更通过 TRADE_LOCK 协调。
- */
 public final class AutoFollowService extends Service {
     static final String WATCH = "watch";
     static final String DEMO_WEB = "testnet-web";
@@ -110,6 +106,9 @@ public final class AutoFollowService extends Service {
     private final AtomicReference<InitialSelection> initialSelection = new AtomicReference<>();
     private long reads, misses;
     private long nextBaselineAttempt, nextPositionReview;
+    private long nextProvisionalReview, provisionalBefore = Long.MAX_VALUE;
+    private Set<String> reviewingLegs = Collections.emptySet();
+    private boolean baselinePolicyApplied;
     private long nextBaselineReview, baselineReviewBefore = Long.MAX_VALUE;
     private long baselineOldest = Long.MAX_VALUE;
     private int baselineRowsKept, baselineOldestCount, baselineStalls;
@@ -169,10 +168,15 @@ public final class AutoFollowService extends Service {
         final BigDecimal margin, copyFactor;
         final long head, backfilled;
         final List<Rules.Signal> candidates;
-        final int withoutPrice;
+        final int withoutPrice, awaitingReview;
 
         InitialPositions(String mode, Rules.Config config, LeaderArchive.State state, Rules.Strategy strategy,
                 BigDecimal margin, BigDecimal copyFactor) {
+            this(mode, config, state, strategy, margin, copyFactor, Collections.emptySet());
+        }
+
+        InitialPositions(String mode, Rules.Config config, LeaderArchive.State state, Rules.Strategy strategy,
+                BigDecimal margin, BigDecimal copyFactor, Set<String> reviewing) {
             this.mode = mode;
             this.strategy = strategy;
             this.margin = margin;
@@ -181,10 +185,15 @@ public final class AutoFollowService extends Service {
             head = state.head;
             backfilled = state.backfilled;
             List<Rules.Signal> rows = new ArrayList<>();
-            int missing = 0;
+            int missing = 0, pending = 0;
             for (String symbol : config.symbols) {
                 for (Rules.Action action : new Rules.Action[]{Rules.Action.OPEN_LONG, Rules.Action.OPEN_SHORT}) {
-                    LeaderHistory.Holding holding = state.holdings.get(symbol + "|" + action.positionSide());
+                    String key = symbol + "|" + action.positionSide();
+                    if (reviewing.contains(key)) {
+                        pending++;
+                        continue;
+                    }
+                    LeaderHistory.Holding holding = state.holdings.get(key);
                     if (holding == null || holding.quantity.signum() <= 0) continue;
                     if (holding.entryPrice == null || holding.updatedAt <= 0) {
                         missing++;
@@ -198,6 +207,7 @@ public final class AutoFollowService extends Service {
             }
             candidates = Collections.unmodifiableList(rows);
             withoutPrice = missing;
+            awaitingReview = pending;
         }
 
         boolean canAdd() { return !candidates.isEmpty() && (strategy != Rules.Strategy.EXPOSURE || margin != null); }
@@ -513,9 +523,7 @@ public final class AutoFollowService extends Service {
                 String value = intent.getStringExtra(EXTRA_COPY_FACTOR);
                 if (value != null && requestedStrategy == Rules.Strategy.EXPOSURE) requestedCopyFactor = Rules.copyFactor(value);
                 String limit = intent.getStringExtra(EXTRA_COPY_SLIPPAGE);
-                if (limit != null && requestedStrategy == Rules.Strategy.EXPOSURE) {
-                    requestedCopySlippage = Rules.adjustmentSlippage(limit);
-                }
+                if (limit != null) requestedCopySlippage = Rules.adjustmentSlippage(limit);
             }
         } catch (IllegalArgumentException invalid) {
             startRequested = false;
@@ -611,6 +619,8 @@ public final class AutoFollowService extends Service {
                     book.copyFactor = requestedCopyFactor;
                     book.copySlippage = limit;
                 }
+            } else if (requestedCopySlippage != null) {
+                book.copySlippage = requestedCopySlippage;
             }
             if (resume && coldStart && followsWebsite(mode)) book.reseedIdlePositions();
             if (!resume && previous != null && previous.config.portfolio.equals(initial.portfolio)) {
@@ -618,16 +628,7 @@ public final class AutoFollowService extends Service {
                 book.notice = previous.notice;
                 book.detections = previous.detections;
             }
-            if (followsWebsite(mode)) {
-                initialChoiceKey = "initial_choice_" + mode + "_" + initial.portfolio + "_" + fingerprint
-                        + (book.strategy == Rules.Strategy.EXPOSURE ? "_exposure" : "")
-                        + (selection == 0 ? "" : "_selection_" + selection);
-                boolean matched = sameSelection && previous.config.portfolio.equals(initial.portfolio)
-                        && previous.account.equals(fingerprint) && previous.strategy == book.strategy;
-                book.initialChoiceDone = store.prefs.getBoolean(initialChoiceKey, false)
-                        || (matched && previous.initialChoiceDone);
-                if (book.initialChoiceDone) store.prefs.edit().putBoolean(initialChoiceKey, true).apply();
-            }
+            if (followsWebsite(mode)) restoreInitialChoice(fingerprint, selection, resume);
             if (api != null) execution = new FollowExecutor(book, api, () -> store.save(file, book.json()),
                     (id, message, sound) -> Notices.trade(this, id, label(mode), message, sound),
                     id -> !store.waitCancellations(mode).contains(id),
@@ -697,7 +698,6 @@ public final class AutoFollowService extends Service {
         } catch (Exception failure) { end(problem(failure)); }
     }
 
-    // 官网读取可能卡在分页或暂时不可用。每轮先处理已提交委托，再决定是否继续读网页或做测试网演练。
     private void cycle() {
         nextCycle = null;
         if (stopped) return;
@@ -784,10 +784,6 @@ public final class AutoFollowService extends Service {
         }
     }
 
-    /**
-     * 从档案的最新成交出发读网页。首次、切换组合或旧基线不完整时展开历史，
-     * 日常轮询只需接上水位。能确认分页结果时才启动成交复核，之后在锁内入档和消费。
-     */
     private void captureAndFollow() throws Exception {
         LeaderArchive.State before = archive.state(initial.portfolio);
         boolean switched = needsSwitchBaseline();
@@ -797,12 +793,14 @@ public final class AutoFollowService extends Service {
         }
         boolean archivedEmpty = before.head > 0 && before.window.isEmpty();
         boolean expand = switched || !before.historyComplete || archivedEmpty;
+        boolean tryArchiveJoin = switched && before.historyComplete && before.latest() != null;
         long now = SystemClock.elapsedRealtime();
         if (expand && now < nextBaselineAttempt) {
             throw new WebsiteCapture.Failure("等待补齐官网基线", nextBaselineAttempt - now, false);
         }
         if (expand) {
-            if (baselineRowsKept > 0) status("正在继续核对官网基线 · 已保留 " + baselineRowsKept + " 笔");
+            if (tryArchiveJoin) status("正在衔接旧档案");
+            else if (baselineRowsKept > 0) status("正在继续核对官网基线 · 已保留 " + baselineRowsKept + " 笔");
             else status(switched || before.head == 0 ? "正在逐页建立本次跟单基线" : "正在展开官网历史以补录旧基线");
         }
         WebsiteCapture.Read read;
@@ -810,18 +808,20 @@ public final class AutoFollowService extends Service {
             LeaderArchive.State reference = before;
             read = source.fetch(switched ? null : reference.latest(),
                     rows -> archive.connectsToTail(initial.portfolio, reference, rows), expand,
-                    switched || !reference.historyComplete || archive.needsEmptyRecheck(initial.portfolio, reference));
+                    switched || !reference.historyComplete || archive.needsEmptyRecheck(initial.portfolio, reference),
+                    tryArchiveJoin);
         }
         finally {
             if (expand) nextBaselineAttempt = SystemClock.elapsedRealtime() + BASELINE_RETRY_MS;
         }
         long detected = System.currentTimeMillis();
-        if (before.historyComplete && (!expand || read.historyComplete)) {
+        if (before.historyComplete && !read.joinedArchive && !read.recovered && !reconciliationPending
+                && (!expand || read.historyComplete)) {
             recheckArchivedBaseline(initial.portfolio);
             before = archive.state(initial.portfolio);
         }
         if ((expand && read.historyComplete) || (!expand && (read.recoveryDetail.isEmpty() || read.recovered))) {
-            read = verifyWebsiteRows(read, switched);
+            read = verifyWebsiteRows(before, read, switched);
             before = archive.state(initial.portfolio);
         }
         synchronized (TRADE_LOCK) {
@@ -834,21 +834,68 @@ public final class AutoFollowService extends Service {
         return book.portfolioSelection > 0 && book.portfolioSelection != archive.verifiedSelection(initial.portfolio);
     }
 
-    // 每轮最多独立复核两组同秒成交。未完成的组留在 SQLite，下一轮继续复核后再接纳本批记录。
-    private WebsiteCapture.Read verifyWebsiteRows(WebsiteCapture.Read read, boolean switched) throws Exception {
+    private WebsiteCapture.Read verifyWebsiteRows(LeaderArchive.State before, WebsiteCapture.Read read, boolean switched) throws Exception {
         if (read.rows.isEmpty()) return read;
         String portfolio = initial.portfolio;
-        reviewClosedPositions(portfolio, read.rows, read.historyComplete);
+        boolean joined = before.historyComplete && before.latest() != null
+                && (read.joinedArchive || (!read.historyComplete && archive.connectsToTail(portfolio, before, read.rows)));
+        if (joined) read = read.withRows(archive.normalizeArchiveOverlap(portfolio, before, read.rows, read.leaderMargin));
+        boolean freshArchive = !joined && before.head == 0 && !before.historyComplete && read.historyComplete;
+        if (freshArchive) {
+            TradeReview.BaselineCounts counts = TradeReview.baselineCounts(read.rows);
+            archive.rememberBaselineCounts(portfolio, read.rows, counts.settled);
+            read = read.withRows(counts.rows);
+        } else if (before.historyComplete && !baselinePolicyApplied) {
+            synchronized (TRADE_LOCK) {
+                if (archive.settlePendingBaselineCounts(portfolio)) {
+                    lastVerifiedSnapshot = -1;
+                    initialSelection.set(null);
+                    changed();
+                    before = archive.state(portfolio);
+                    read = read.withRows(archive.normalizeProvisional(portfolio, read.rows, read.leaderMargin));
+                }
+                baselinePolicyApplied = true;
+            }
+        }
+        long since = reviewFrom(read.rows, before, switched, joined);
+        if (joined && since > read.rows.get(read.rows.size() - 1).time) {
+            // All visible trades were already confirmed. Don't reopen the site to review them again.
+            return read;
+        }
+        reviewClosedPositions(portfolio, read.rows, read.historyComplete && !joined, since, !joined);
         read = read.withRows(archive.normalizeReviewedDuplicates(portfolio, read.rows, read.leaderMargin));
-        archive.queueReviews(portfolio, TradeReview.repeatedSeconds(read.rows));
-        long since = switched ? Long.MAX_VALUE : archive.currentSegmentTime(portfolio);
-        if (since == Long.MAX_VALUE && !read.rows.isEmpty()) since = read.rows.get(0).time;
-        LeaderArchive.Review review = archive.nextReview(portfolio, since);
+        Map<Long, List<Rules.Signal>> provisional = new LinkedHashMap<>();
+        if (freshArchive) {
+            for (Map.Entry<Long, List<Rules.Signal>> group : TradeReview.repeatedSeconds(read.rows).entrySet()) {
+                boolean exactRepeat = TradeReview.counts(group.getValue()).size() < group.getValue().size();
+                if (exactRepeat && !archive.hasCheckedReview(portfolio, group.getKey(), group.getValue())) {
+                    boolean closing = group.getValue().stream().anyMatch(row -> TradeReview.knownAction(row) && !row.action.opens);
+                    List<Rules.Signal> assumed = closing ? group.getValue()
+                            : TradeReview.limitCopies(group.getValue(), read.pageRepeatLimits);
+                    provisional.put(group.getKey(), assumed);
+                }
+            }
+        } else {
+            if (before.historyComplete && !joined) recheckProvisional(portfolio);
+            read = read.withRows(archive.normalizeReviewedDuplicates(portfolio, read.rows, read.leaderMargin));
+            read = read.withRows(archive.normalizeProvisional(portfolio, read.rows, read.leaderMargin));
+        }
+        since = reviewFrom(read.rows, before, switched, joined);
+        Map<Long, List<Rules.Signal>> candidates = TradeReview.repeatedSeconds(read.rows);
+        candidates.keySet().removeAll(provisional.keySet());
+        long reviewFrom = since;
+        candidates.keySet().removeIf(stamp -> stamp < reviewFrom);
+        archive.queueReviews(portfolio, candidates);
+        long through = read.rows.get(read.rows.size() - 1).time;
+        Set<Long> visible = new LinkedHashSet<>();
+        for (Rules.Signal row : read.rows) if (row.time >= since) visible.add(row.time);
+        LeaderArchive.Review review = archive.nextReview(portfolio, since, through, visible);
         Map<Long, List<Rules.Signal>> justChecked = new LinkedHashMap<>();
         for (int checked = 0; review != null && checked < 2; checked++) {
             initialPositions = null;
             status("正在复核同秒成交 · " + TradeNotice.fullTime(review.stamp));
             List<Rules.Signal> official = source.review(review.stamp);
+            if (freshArchive) official = TradeReview.baselineCounts(official).rows;
             synchronized (TRADE_LOCK) {
                 if (stopped) throw WebsiteCapture.reviewFailure("本轮跟踪已停止");
                 if (archive.resolveReview(portfolio, review, official)) {
@@ -858,10 +905,17 @@ public final class AutoFollowService extends Service {
                 }
             }
             justChecked.put(review.stamp, official);
-            review = archive.nextReview(portfolio, since);
+            review = archive.nextReview(portfolio, since, through, visible);
         }
         if (review != null) throw WebsiteCapture.reviewFailure("还有其他成交等待独立读取");
-        return read.withRows(archive.verifiedRows(portfolio, read.rows, read.leaderMargin, justChecked));
+        return read.withRows(archive.verifiedRows(portfolio, read.rows, read.leaderMargin, justChecked, since,
+                provisional.keySet())).withProvisional(provisional);
+    }
+
+    private long reviewFrom(List<Rules.Signal> rows, LeaderArchive.State before, boolean switched, boolean joined) {
+        if (joined) return archive.reviewFromArchiveTail(initial.portfolio, before, rows);
+        long segment = switched ? Long.MAX_VALUE : archive.currentSegmentTime(initial.portfolio);
+        return segment == Long.MAX_VALUE ? rows.get(0).time : segment;
     }
 
     private void recheckArchivedBaseline(String portfolio) throws Exception {
@@ -894,12 +948,45 @@ public final class AutoFollowService extends Service {
         }
     }
 
-    private void reviewClosedPositions(String portfolio, List<Rules.Signal> rows, boolean fullHistory) throws Exception {
+    private void recheckProvisional(String portfolio) throws Exception {
+        long now = SystemClock.elapsedRealtime();
+        if (now < nextProvisionalReview) return;
+        nextProvisionalReview = now + 60000;
+        for (LeaderArchive.Review review : archive.provisionalReviews(portfolio)) {
+            if (review.stamp >= provisionalBefore) continue;
+            provisionalBefore = review.stamp;
+            try {
+                List<Rules.Signal> checked = source.reviewProvisional(review.stamp);
+                synchronized (TRADE_LOCK) {
+                    if (stopped) return;
+                    if (archive.resolveProvisionalReview(portfolio, review, checked, false)) {
+                        lastVerifiedSnapshot = -1;
+                        initialSelection.set(null);
+                        changed();
+                    }
+                }
+            } catch (WebsiteCapture.Failure unavailable) {
+                // This optional read may be empty or stale even after the dates have changed.
+            }
+            return;
+        }
+        provisionalBefore = Long.MAX_VALUE;
+    }
+
+    private void reviewClosedPositions(String portfolio, List<Rules.Signal> rows, boolean fullHistory,
+            long reviewFrom, boolean scanArchived) throws Exception {
         long now = SystemClock.elapsedRealtime();
         if (now < nextPositionReview) return;
         boolean checkDirection = OneWayTrades.hasSideReports(rows) && (fullHistory
                 || !archive.resolveTradeSides(portfolio, archive.state(portfolio), rows, closedPositionHistory).pending.isEmpty());
-        if (!checkDirection && TradeReview.repeatedSeconds(rows).isEmpty() && !archive.hasArchivedRepeats(portfolio)) return;
+        boolean visibleRepeats = false;
+        for (Map.Entry<Long, List<Rules.Signal>> group : TradeReview.repeatedSeconds(rows).entrySet()) {
+            if (group.getKey() >= reviewFrom && !archive.hasCheckedReview(portfolio, group.getKey(), group.getValue())) {
+                visibleRepeats = true;
+                break;
+            }
+        }
+        if (!checkDirection && !visibleRepeats && !(scanArchived && (archive.hasArchivedRepeats(portfolio) || !archive.provisionalReviews(portfolio).isEmpty()))) return;
         nextPositionReview = now + 60000;
         List<ClosedTradeReview.Position> positions;
         try {
@@ -923,10 +1010,6 @@ public final class AutoFollowService extends Service {
         }
     }
 
-    /**
-     * 先确认基线、连续性和方向，再更新档案与账本。基线连续多轮没有进展时转为手动续读，
-     * 避免不断点击官网。档案有缺口、白名单新增成交开平不明或仍有委托待核对时，暂停新委托。
-     */
     private void acceptCapture(LeaderArchive.State before, WebsiteCapture.Read read, long received, long detected) throws Exception {
         // Completion callbacks may use a confirmed snapshot only after this capture has fully settled.
         lastVerifiedSnapshot = -1;
@@ -954,8 +1037,16 @@ public final class AutoFollowService extends Service {
             throw new WebsiteCapture.Failure(read.recoveryDetail + " · 等待衔接档案后恢复跟单", 6000, false);
         }
         if (OneWayTrades.hasSideReports(read.rows)) {
-            LeaderArchive.TradeSides sides = archive.resolveTradeSides(initial.portfolio, before, read.rows, closedPositionHistory);
-            read = read.withRows(sides.rows);
+            List<Rules.Signal> working = TradeReview.replace(read.rows, read.provisional, read.leaderMargin);
+            LeaderArchive.TradeSides sides = archive.resolveTradeSides(initial.portfolio, before, working, closedPositionHistory);
+            if (read.provisional.isEmpty()) read = read.withRows(sides.rows);
+            else {
+                Map<String, Rules.Signal> resolved = new LinkedHashMap<>();
+                for (Rules.Signal row : sides.rows) resolved.put(row.id, row);
+                List<Rules.Signal> raw = new ArrayList<>(read.rows.size());
+                for (Rules.Signal row : read.rows) raw.add(resolved.getOrDefault(row.id, row));
+                read = read.withRows(raw);
+            }
             if (execution != null && before.historyComplete && !before.window.isEmpty() && !switched) {
                 for (String symbol : sides.pending) {
                     if (!book.config.symbols.contains(symbol)) continue;
@@ -969,8 +1060,10 @@ public final class AutoFollowService extends Service {
         LeaderArchive.Update update;
         try {
             update = archive.capture(initial.portfolio, read.name, read.rows, detected,
-                    read.historyComplete, read.historyDetail, recover, book.portfolioSelection);
+                    read.historyComplete && !read.joinedArchive, read.historyDetail,
+                    recover, book.portfolioSelection, read.joinedArchive, read.provisional);
         } catch (LeaderHistory.Gap conflict) {
+            if (read.joinedArchive && source != null) source.baselineAccepted();
             throw new WebsiteCapture.Failure(conflict.getMessage(), 6000, false);
         }
         leaderMarketSymbols = archive.projection(initial.portfolio, update.state).openSymbols();
@@ -995,6 +1088,11 @@ public final class AutoFollowService extends Service {
         if (update.baseline || update.added > 0) changed();
         applyCancellations();
         reads++;
+        List<LeaderArchive.Review> reviews = archive.provisionalReviews(initial.portfolio);
+        Set<String> held = new LinkedHashSet<>();
+        for (LeaderArchive.Review review : reviews) held.addAll(TradeReview.repeatedLegs(review.sample));
+        reviewingLegs = held;
+        if (execution != null) execution.holdTradeReviews(reviewingLegs);
         LeaderArchive.State current = update.state;
         if (book.pending == null && execution != null
                 && (!book.accountSeeded || recover || book.copyReplanPending || book.archiveCursor < current.recoveryHead)) {
@@ -1011,7 +1109,8 @@ public final class AutoFollowService extends Service {
                     persist();
                 }
             } else syncBook(current);
-            boolean updated = book.enrichWaiting(current.window);
+            boolean updated = book.syncLeaderAverages(current.holdings);
+            updated |= book.enrichWaiting(current.window);
             updated |= book.supplyAdjustmentMargin(read.leaderMargin);
             if (updated) persist();
             reconciliationPending = false;
@@ -1023,20 +1122,30 @@ public final class AutoFollowService extends Service {
         updateWatchSymbols();
         Rules.Signal last = current.latest();
         String now = TradeNotice.time(System.currentTimeMillis());
-        store.prefs.edit().putString("auto_capture", now + " · 读到 " + read.rows.size() + " 笔"
+        String reviewDetail = reviews.isEmpty() ? "" : "\n同秒成交待核对 " + reviews.size() + " 组 · "
+                + TradeNotice.fullTime(reviews.get(0).stamp) + " · "
+                + String.join("、", TradeReview.repeatedLegs(reviews.get(0).sample))
+                        .replace("|LONG", " 多").replace("|SHORT", " 空");
+        store.prefs.edit().putString("auto_capture", now + " · 读到 " + current.window.size() + " 笔"
                 + " · 新增 " + update.added + (last == null ? "\n官网目前无成交" : "\n最新 " + TradeNotice.time(last.time) + " "
                 + last.symbol + " " + last.action.label + " " + Rules.show(last.quantity)
                 + " " + Rules.base(last.symbol) + " · " + TradeNotice.price(last.price) + " USDT"
                 + (last.action.opens ? "" : " · " + TradeNotice.pnl(last.realizedPnl)))
-                + (read.recoveryDetail.isEmpty() ? "" : "\n" + read.recoveryDetail))
+                + (read.joinedArchive ? "\n" + update.state.historyDetail
+                        : read.recoveryDetail.isEmpty() ? "" : "\n" + read.recoveryDetail) + reviewDetail)
                 .remove("auto_capture_error").remove("auto_web_access").apply();
         if (book.pending != null) {
             status("官网成交已归档 · 账户委托仍待核对");
         } else if (execution == null) {
-            status(update.baseline ? "已建立官网基线" : "官网记录已核对");
+            status(read.joinedArchive ? "已衔接旧档案"
+                    : update.baseline ? "已建立官网基线" : "官网记录已核对");
         } else if (read.historyComplete && !valid(received)) {
-            initialPositions = null;
-            status("官网基线已建档 · 等待核对最新成交");
+            if (waitingForInitialChoice() && !current.window.isEmpty()) {
+                InitialPositions preview = new InitialPositions(mode, initial, current, book.strategy,
+                        read.leaderMargin, book.copyFactor, reviewingLegs);
+                initialPositions = preview.candidates.isEmpty() && preview.withoutPrice == 0 && preview.awaitingReview == 0 ? null : preview;
+            }
+            status("官网档案已核对 · 等待最新成交确认");
         } else if (waitingForInitialChoice() && current.head > 0 && current.window.isEmpty()) {
             status("官网当前无可见成交，保留旧档案并等待记录");
         } else if (waitingForInitialChoice() && !applyInitialChoice(current, read.leaderMargin)) {
@@ -1050,6 +1159,15 @@ public final class AutoFollowService extends Service {
             try { status(execution.decide(currentRules, () -> valid(received), () -> openingAllowed(currentRules))); }
             finally { accountReadBarrier = SystemClock.elapsedRealtimeNanos(); }
         }
+    }
+
+    private void restoreInitialChoice(String fingerprint, long selection, boolean resume) {
+        initialChoiceKey = "initial_choice_" + mode + "_" + initial.portfolio + "_" + fingerprint
+                + (book.strategy == Rules.Strategy.EXPOSURE ? "_exposure" : "")
+                + (selection == 0 ? "" : "_selection_" + selection);
+        book.initialChoiceDone = resume && (book.initialChoiceDone || store.prefs.getBoolean(initialChoiceKey, false));
+        if (book.initialChoiceDone) store.prefs.edit().putBoolean(initialChoiceKey, true).apply();
+        else if (!resume) store.prefs.edit().remove(initialChoiceKey).apply();
     }
 
     private boolean waitingForInitialChoice() { return initialChoiceKey != null && !book.initialChoiceDone; }
@@ -1070,9 +1188,9 @@ public final class AutoFollowService extends Service {
     }
 
     private boolean applyInitialChoice(LeaderArchive.State state, BigDecimal margin) throws Exception {
-        InitialPositions next = new InitialPositions(mode, initial, state, book.strategy, margin, book.copyFactor);
+        InitialPositions next = new InitialPositions(mode, initial, state, book.strategy, margin, book.copyFactor, reviewingLegs);
         InitialSelection selection = initialSelection.getAndSet(null);
-        boolean noPositions = next.candidates.isEmpty() && next.withoutPrice == 0;
+        boolean noPositions = next.candidates.isEmpty() && next.withoutPrice == 0 && next.awaitingReview == 0;
         List<Rules.Signal> entries = new ArrayList<>();
         if (selection != null) for (Rules.Signal candidate : next.candidates) {
             if (selection.ids.contains(candidate.id)) entries.add(candidate);
@@ -1084,6 +1202,7 @@ public final class AutoFollowService extends Service {
             return false;
         }
         int accepted = book.finishInitialChoice(entries);
+        if (noPositions) book.log("首次跟单 · 白名单内没有可补的已有仓位");
         if (accepted > 0) book.log("首次跟单 · " + accepted + " 个已有仓位已加入等待");
         if (accepted < entries.size()) book.log("首次跟单 · 本账户启动前已有同方向仓位，保留至带单员该方向新增开仓");
         persist();
@@ -1118,10 +1237,6 @@ public final class AutoFollowService extends Service {
         persist();
     }
 
-    /**
-     * 按档案序号推进持久化账本。补录和历史修订只在原水位重算仓位，恢复段按净仓位变化跟单，
-     * 避免把离线期间已完成的开平重新执行。恢复段之后的新增成交再逐笔处理。
-     */
     private void syncBook(LeaderArchive.State state) throws Exception {
         if (!book.baselineReady && book.window.isEmpty()) {
             establishBookBaseline(state);
@@ -1132,18 +1247,28 @@ public final class AutoFollowService extends Service {
         if ((cursor == 0 && !book.window.isEmpty()) || cursor > state.head || book.baselineBackfilled > state.backfilled) {
             throw new WebsiteCapture.Failure("旧跟单账本与档案没有共同锚点，暂停发单", 6000, false);
         }
+        for (String leg : reviewingLegs) book.reviewCursors.putIfAbsent(leg, cursor);
         long archiveRevision = archive.revision(initial.portfolio);
         boolean revised = book.archiveRevision < archiveRevision;
         boolean merged = book.baselineBackfilled < state.backfilled || revised;
         if (merged) {
             Map<String, BigDecimal> oldModel = archive.visibleAt(initial.portfolio, cursor, book.baselineBackfilled, book.archiveRevision);
             Map<String, BigDecimal> newModel = archive.visibleAt(initial.portfolio, cursor, state.backfilled, archiveRevision);
+            for (Map.Entry<String, Long> hold : book.reviewCursors.entrySet()) {
+                String leg = hold.getKey();
+                long start = hold.getValue();
+                oldModel.put(leg, archive.visibleAt(initial.portfolio, start, book.baselineBackfilled,
+                        book.archiveRevision).getOrDefault(leg, Rules.ZERO));
+                newModel.put(leg, archive.visibleAt(initial.portfolio, start, state.backfilled,
+                        archiveRevision).getOrDefault(leg, Rules.ZERO));
+            }
             book.rebaseLeaderPositions(oldModel, newModel);
             if (revised) book.removeStaleInitialEntries(oldModel, newModel);
             book.baselineBackfilled = state.backfilled;
             book.archiveRevision = archiveRevision;
         }
-        if (!merged && cursor == state.head && book.archiveCursor == cursor) return;
+        boolean resumed = resumeReviewedLegs(state, cursor);
+        if (!merged && !resumed && cursor == state.head && book.archiveCursor == cursor) return;
         if (cursor < state.recoveryHead) {
             List<Rules.Signal> recovered = new ArrayList<>();
             Map<String, Long> detected = new LinkedHashMap<>();
@@ -1152,7 +1277,7 @@ public final class AutoFollowService extends Service {
                 if (page.isEmpty()) throw new IllegalStateException("成交档案序号不连续");
                 for (LeaderArchive.Record row : page) {
                     if (row.ordinal != ++cursor) throw new IllegalStateException("成交档案序号不连续");
-                    if (row.excluded) continue;
+                    if (row.excluded || reviewing(row.signal)) continue;
                     recovered.add(row.signal);
                     detected.put(row.signal.id, row.detectedAt);
                 }
@@ -1168,7 +1293,7 @@ public final class AutoFollowService extends Service {
             Map<String, Long> detected = new LinkedHashMap<>();
             for (LeaderArchive.Record row : page) {
                 if (row.ordinal != ++cursor) throw new IllegalStateException("成交档案序号不连续");
-                if (row.excluded) continue;
+                if (row.excluded || reviewing(row.signal)) continue;
                 rows.add(row.signal);
                 detected.put(row.signal.id, row.detectedAt);
             }
@@ -1178,6 +1303,40 @@ public final class AutoFollowService extends Service {
         book.window = state.window;
         book.archiveCursor = cursor;
         persist();
+    }
+
+    private boolean reviewing(Rules.Signal signal) {
+        if (signal.reportedAction.sideOnly()) {
+            return reviewingLegs.contains(signal.symbol + "|LONG") || reviewingLegs.contains(signal.symbol + "|SHORT");
+        }
+        return reviewingLegs.contains(signal.leg());
+    }
+
+    private boolean resumeReviewedLegs(LeaderArchive.State state, long through) throws Exception {
+        Set<String> resumed = new LinkedHashSet<>(book.reviewCursors.keySet());
+        resumed.removeAll(reviewingLegs);
+        if (resumed.isEmpty()) return false;
+        long cursor = Long.MAX_VALUE;
+        for (String leg : resumed) cursor = Math.min(cursor, book.reviewCursors.get(leg));
+        List<Rules.Signal> rows = new ArrayList<>();
+        Map<String, Long> detected = new LinkedHashMap<>();
+        while (cursor < through) {
+            List<LeaderArchive.Record> page = archive.after(initial.portfolio, cursor, through);
+            if (page.isEmpty()) throw new IllegalStateException("成交档案序号不连续");
+            for (LeaderArchive.Record row : page) {
+                if (row.ordinal != ++cursor) throw new IllegalStateException("成交档案序号不连续");
+                String leg = row.signal.leg();
+                if (!row.excluded && resumed.contains(leg) && cursor > book.reviewCursors.get(leg)) {
+                    rows.add(row.signal);
+                    detected.put(row.signal.id, row.detectedAt);
+                }
+            }
+        }
+        Map<String, LeaderHistory.Holding> holdings = through == state.head
+                ? state.holdings : archive.holdingsAt(initial.portfolio, through);
+        book.acceptRecovered(rows, execution != null && !waitingForInitialChoice(), detected, holdings);
+        book.reviewCursors.keySet().removeAll(resumed);
+        return true;
     }
 
     private void applyCancellations() throws Exception {

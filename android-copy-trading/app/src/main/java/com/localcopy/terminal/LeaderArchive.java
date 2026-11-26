@@ -24,14 +24,9 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/**
- * 按组合维护 SQLite 成交档案。leader 保存已确认快照和水位，trades 保存逐笔成交，
- * trade_reviews 保存同秒复核证据，leader_sessions 记录本次组合选择对应的起点。
- * 本机账户的已核对成交单独写入 account_fills。
- */
 final class LeaderArchive extends SQLiteOpenHelper {
     private static final String DB_NAME = "leader-history.db";
-    static final int DB_VERSION = 14;
+    static final int DB_VERSION = 15;
     private static final String DETECTED_FILTER = " AND kind IN(0,-2) AND excluded_revision=0";
     private static final String TRADE_COLUMNS = "ordinal,stamp,symbol,action,price,quantity,kind,pnl,detected_at,turnover,lead_margin,event,excluded_revision";
     private static final int SUPPLEMENT = 3;
@@ -60,6 +55,7 @@ final class LeaderArchive extends SQLiteOpenHelper {
                 + "symbol TEXT NOT NULL, action TEXT NOT NULL, price TEXT NOT NULL, quantity TEXT NOT NULL, "
                 + "ordinal INTEGER, kind INTEGER NOT NULL, pnl TEXT, detected_at INTEGER NOT NULL DEFAULT 0, "
                 + "turnover TEXT, lead_margin TEXT, excluded_revision INTEGER NOT NULL DEFAULT 0, "
+                + "included_revision INTEGER NOT NULL DEFAULT 0, "
                 + "PRIMARY KEY(portfolio,event))");
         db.execSQL("CREATE INDEX trades_time ON trades(portfolio,stamp DESC,event DESC)");
         db.execSQL("CREATE UNIQUE INDEX trades_ordinal ON trades(portfolio,ordinal)");
@@ -73,6 +69,11 @@ final class LeaderArchive extends SQLiteOpenHelper {
         if (oldVersion < 1 || oldVersion >= DB_VERSION || newVersion != DB_VERSION) {
             throw new IllegalStateException("此版本不支持修改该成交档案格式");
         }
+        db.execSQL("ALTER TABLE trades ADD COLUMN included_revision INTEGER NOT NULL DEFAULT 0");
+        if (oldVersion >= 9) {
+            db.execSQL("ALTER TABLE trade_reviews ADD COLUMN provisional INTEGER NOT NULL DEFAULT 0");
+        }
+        if (oldVersion == 14) return;
         if (oldVersion >= 9) {
             db.execSQL("ALTER TABLE trade_reviews ADD COLUMN baseline_checked INTEGER NOT NULL DEFAULT 0");
         }
@@ -146,7 +147,7 @@ final class LeaderArchive extends SQLiteOpenHelper {
     private static void createTradeReviews(SQLiteDatabase db) {
         db.execSQL("CREATE TABLE trade_reviews (portfolio TEXT NOT NULL, stamp INTEGER NOT NULL, "
                 + "sample TEXT NOT NULL, checked TEXT, legacy INTEGER NOT NULL DEFAULT 0, "
-                + "baseline_checked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(portfolio,stamp))");
+                + "baseline_checked INTEGER NOT NULL DEFAULT 0, provisional INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(portfolio,stamp))");
     }
 
     private static void createSessions(SQLiteDatabase db) {
@@ -328,7 +329,7 @@ final class LeaderArchive extends SQLiteOpenHelper {
             Long earlierBatch = batches.putIfAbsent(legAtTime, record.detectedAt);
             if (earlierBatch != null && earlierBatch != record.detectedAt) ambiguous.add(legAtTime);
         }
-        // 缺口后顺序可核对的记录可用于界面仓位估算，跟单仍等连续档案恢复。
+        // Observations across a gap only contribute to the displayed scenario.
         Map<String, LeaderHistory.Holding> visible = new LinkedHashMap<>(confirmed.holdings);
         for (int i = observations.size() - 1; i >= 0; i--) {
             Rules.Signal row = observations.get(i).signal;
@@ -401,11 +402,12 @@ final class LeaderArchive extends SQLiteOpenHelper {
         return hasConfirmedOverlap(db, portfolio, rows, firstCurrentOrdinal(db, portfolio));
     }
 
-    // 分页时用与正式入档相同的规则试接水位，只做验证，避免结束条件和入档条件分叉。
     boolean connectsToTail(String portfolio, State state, List<Rules.Signal> rows) {
         try {
-            LeaderHistory.merge(captureReference(getReadableDatabase(), portfolio, state),
-                    normalizeReviewedDuplicates(portfolio, rows, null), true, !state.orderedSnapshot);
+            List<Rules.Signal> reference = captureReference(getReadableDatabase(), portfolio, state);
+            if (reference.isEmpty() || rows.isEmpty()) return false;
+            LeaderHistory.merge(reference, normalizeArchiveOverlap(portfolio, state, rows, null),
+                    true, !state.orderedSnapshot);
             return true;
         } catch (LeaderHistory.Gap | JSONException missing) {
             return false;
@@ -461,7 +463,6 @@ final class LeaderArchive extends SQLiteOpenHelper {
         return new TradeSides(resolved, pending);
     }
 
-    // 缺口后的可见成交先作为候选记录，保留首次检测时间。已确认快照、水位和仓位仍取自连续档案。
     void observeGap(String portfolio, String name, List<Rules.Signal> rows, long now) throws JSONException {
         if (rows.isEmpty()) return;
         SQLiteDatabase db = getWritableDatabase();
@@ -512,9 +513,10 @@ final class LeaderArchive extends SQLiteOpenHelper {
                 long stamp = entry.getKey();
                 List<Rules.Signal> sample = entry.getValue();
                 boolean legacy = false;
-                try (Cursor row = db.rawQuery("SELECT sample,checked,legacy FROM trade_reviews WHERE portfolio=? AND stamp=?",
+                try (Cursor row = db.rawQuery("SELECT sample,checked,legacy,provisional FROM trade_reviews WHERE portfolio=? AND stamp=?",
                         new String[]{portfolio, Long.toString(stamp)})) {
                     if (row.moveToFirst()) {
+                        if (row.getInt(3) != 0) continue;
                         legacy = row.getInt(2) == 1;
                         List<Rules.Signal> earlier = readReviewRows(row.getString(0));
                         if (row.isNull(1)) {
@@ -540,13 +542,21 @@ final class LeaderArchive extends SQLiteOpenHelper {
     }
 
     Review nextReview(String portfolio, long since) throws JSONException {
+        return nextReview(portfolio, since, Long.MAX_VALUE, null);
+    }
+
+    Review nextReview(String portfolio, long since, long through, Set<Long> visible) throws JSONException {
         SQLiteDatabase db = getReadableDatabase();
-        try (Cursor row = db.rawQuery("SELECT stamp,sample,legacy FROM trade_reviews WHERE portfolio=? AND checked IS NULL AND stamp>=? "
-                + "ORDER BY legacy,stamp DESC LIMIT 1", new String[]{portfolio, Long.toString(since)})) {
-            if (!row.moveToFirst()) return null;
-            long stamp = row.getLong(0);
-            List<Rules.Signal> sample = readReviewRows(row.getString(1));
-            return new Review(stamp, sample.isEmpty() ? confirmedAt(db, portfolio, stamp) : sample, row.getInt(2) == 1);
+        try (Cursor row = db.rawQuery("SELECT stamp,sample,legacy FROM trade_reviews "
+                + "WHERE portfolio=? AND checked IS NULL AND provisional=0 AND stamp BETWEEN ? AND ? ORDER BY legacy,stamp DESC",
+                new String[]{portfolio, Long.toString(since), Long.toString(through)})) {
+            while (row.moveToNext()) {
+                long stamp = row.getLong(0);
+                if (visible != null && !visible.contains(stamp)) continue;
+                List<Rules.Signal> sample = readReviewRows(row.getString(1));
+                return new Review(stamp, sample.isEmpty() ? confirmedAt(db, portfolio, stamp) : sample, row.getInt(2) == 1);
+            }
+            return null;
         }
     }
 
@@ -554,14 +564,13 @@ final class LeaderArchive extends SQLiteOpenHelper {
         return LocalData.readSignals(new JSONArray(value));
     }
 
-    // 旧版基线可能已经写入重复行。只在当前段中挑待复核的历史秒，供服务分批独立重读。
     Review nextBaselineReview(String portfolio, long beforeStamp) {
         SQLiteDatabase db = getReadableDatabase();
         long first = firstCurrentOrdinal(db, portfolio);
         try (Cursor row = db.rawQuery("SELECT t.stamp FROM trades t LEFT JOIN trade_reviews r "
                 + "ON r.portfolio=t.portfolio AND r.stamp=t.stamp WHERE t.portfolio=? AND t.ordinal>=? "
                 + "AND t.stamp<? AND t.excluded_revision=0 AND t.kind IN (1,3,4) "
-                + "AND COALESCE(r.baseline_checked,0)=0 "
+                + "AND COALESCE(r.baseline_checked,0)=0 AND COALESCE(r.provisional,0)=0 "
                 + "GROUP BY t.stamp,t.symbol,t.action,t.price,t.quantity,t.turnover,t.pnl "
                 + "HAVING COUNT(*)>1 ORDER BY t.stamp DESC LIMIT 1",
                 new String[]{portfolio, Long.toString(first), Long.toString(beforeStamp)})) {
@@ -589,9 +598,191 @@ final class LeaderArchive extends SQLiteOpenHelper {
         }
     }
 
+    List<Review> provisionalReviews(String portfolio) throws JSONException {
+        SQLiteDatabase db = getReadableDatabase();
+        List<Review> reviews = new ArrayList<>();
+        try (Cursor row = db.rawQuery("SELECT r.stamp,r.sample FROM trade_reviews r WHERE r.portfolio=? AND r.provisional=1"
+                + " AND EXISTS (SELECT 1 FROM trades t WHERE t.portfolio=r.portfolio AND t.stamp=r.stamp AND t.ordinal>=?)"
+                + " ORDER BY r.stamp DESC", new String[]{portfolio, Long.toString(firstCurrentOrdinal(db, portfolio))})) {
+            while (row.moveToNext()) reviews.add(new Review(row.getLong(0), readReviewRows(row.getString(1)), false));
+        }
+        return reviews;
+    }
+
+    List<Rules.Signal> normalizeProvisional(String portfolio, List<Rules.Signal> rows, BigDecimal margin)
+            throws JSONException {
+        if (rows.isEmpty()) return rows;
+        SQLiteDatabase db = getReadableDatabase();
+        Map<Long, List<Rules.Signal>> replacements = new LinkedHashMap<>();
+        try (Cursor proof = db.rawQuery("SELECT stamp,sample,checked FROM trade_reviews WHERE portfolio=?"
+                + " AND provisional<>0 AND stamp BETWEEN ? AND ?",
+                new String[]{portfolio, Long.toString(rows.get(0).time), Long.toString(rows.get(rows.size() - 1).time)})) {
+            while (proof.moveToNext()) {
+                long stamp = proof.getLong(0);
+                List<Rules.Signal> visible = TradeReview.at(rows, stamp);
+                if (visible.isEmpty()) continue;
+                List<Rules.Signal> sample = readReviewRows(proof.getString(1));
+                if (!proof.isNull(2)) {
+                    List<Rules.Signal> checked = readReviewRows(proof.getString(2));
+                    if (TradeReview.compatible(sample, visible) && !TradeReview.same(checked, visible)) {
+                        replacements.put(stamp, checked);
+                    }
+                    continue;
+                }
+                Map<String, Integer> caps = TradeReview.counts(confirmedAt(db, portfolio, stamp,
+                        firstCurrentOrdinal(db, portfolio)));
+                Map<String, Integer> sampled = TradeReview.counts(sample);
+                caps.keySet().removeIf(key -> sampled.getOrDefault(key, 0) < 2);
+                replacements.put(stamp, TradeReview.limitCopies(visible, caps));
+            }
+        }
+        return TradeReview.replace(rows, replacements, margin);
+    }
+
+    void rememberBaselineCounts(String portfolio, List<Rules.Signal> raw, Map<Long, List<Rules.Signal>> settled)
+            throws JSONException {
+        if (settled.isEmpty()) return;
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            for (Map.Entry<Long, List<Rules.Signal>> group : settled.entrySet()) {
+                saveBaselineCount(db, portfolio, group.getKey(), TradeReview.at(raw, group.getKey()), group.getValue());
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    boolean settlePendingBaselineCounts(String portfolio) throws JSONException {
+        List<Review> pending = provisionalReviews(portfolio);
+        if (pending.isEmpty()) return false;
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            List<Rules.Signal> rows = new ArrayList<>();
+            long first = firstCurrentOrdinal(db, portfolio);
+            try (Cursor found = db.rawQuery("SELECT " + TRADE_COLUMNS + " FROM trades WHERE portfolio=? AND ordinal>=? AND kind IN (1,3,4)"
+                    + " AND (excluded_revision=0 OR (excluded_revision=-1 AND stamp IN "
+                    + "(SELECT stamp FROM trade_reviews WHERE portfolio=? AND provisional=1))) ORDER BY stamp,ordinal",
+                    new String[]{portfolio, Long.toString(first), portfolio})) {
+                while (found.moveToNext()) rows.add(record(found).signal);
+            }
+            Set<Long> stamps = new HashSet<>();
+            for (Review review : pending) stamps.add(review.stamp);
+            Map<Long, List<Rules.Signal>> settled = TradeReview.baselineCounts(rows, stamps).settled;
+            boolean changed = false;
+            for (Review review : pending) {
+                List<Rules.Signal> counted = settled.get(review.stamp);
+                if (counted != null) changed |= resolveProvisionalReview(db, portfolio, review, counted, true);
+            }
+            db.setTransactionSuccessful();
+            return changed;
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    private static void saveBaselineCount(SQLiteDatabase db, String portfolio, long stamp, List<Rules.Signal> sample,
+            List<Rules.Signal> counted) throws JSONException {
+        ContentValues values = new ContentValues();
+        values.put("portfolio", portfolio);
+        values.put("stamp", stamp);
+        values.put("sample", LocalData.signalJson(sample).toString());
+        values.put("checked", LocalData.signalJson(counted).toString());
+        values.put("provisional", 2);
+        values.put("baseline_checked", 1);
+        db.insertWithOnConflict("trade_reviews", null, values, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    boolean hasCheckedReview(String portfolio, long stamp, List<Rules.Signal> rows) throws JSONException {
+        try (Cursor proof = getReadableDatabase().rawQuery("SELECT sample,checked FROM trade_reviews "
+                + "WHERE portfolio=? AND stamp=? AND checked IS NOT NULL",
+                new String[]{portfolio, Long.toString(stamp)})) {
+            return proof.moveToFirst() && (TradeReview.same(rows, readReviewRows(proof.getString(0)))
+                    || TradeReview.same(rows, readReviewRows(proof.getString(1))));
+        }
+    }
+
+    boolean resolveProvisionalReview(String portfolio, Review review, List<Rules.Signal> checked, boolean closedProof)
+            throws JSONException {
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            if (!resolveProvisionalReview(db, portfolio, review, checked, closedProof)) return false;
+            db.setTransactionSuccessful();
+            return true;
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    private boolean resolveProvisionalReview(SQLiteDatabase db, String portfolio, Review review,
+            List<Rules.Signal> checked, boolean closedProof) throws JSONException {
+        // Changing the date filter can return the same duplicate cards. An unchanged count
+        // needs the independent reconciliation of the entire closed position.
+        if (!TradeReview.compatible(review.sample, checked)
+                || (!closedProof && checked.size() >= review.sample.size())) return false;
+        try (Cursor pending = db.rawQuery("SELECT 1 FROM trade_reviews WHERE portfolio=? AND stamp=? AND provisional=1",
+                new String[]{portfolio, Long.toString(review.stamp)})) {
+            if (!pending.moveToFirst()) return false;
+        }
+        long first = firstCurrentOrdinal(db, portfolio);
+        List<Record> observed = new ArrayList<>();
+        try (Cursor rows = db.rawQuery("SELECT " + TRADE_COLUMNS + " FROM trades WHERE portfolio=? AND stamp=?"
+                + " AND ordinal>=? AND excluded_revision IN(0,-1) ORDER BY ordinal",
+                new String[]{portfolio, Long.toString(review.stamp), Long.toString(first)})) {
+            while (rows.moveToNext()) observed.add(record(rows));
+        }
+        if (!TradeReview.same(review.sample, observed.stream().map(r -> r.signal).collect(Collectors.toList()))) return false;
+        List<Record> kept = new ArrayList<>();
+        int next = 0;
+        for (Record row : observed) {
+            if (next < checked.size() && TradeReview.key(row.signal).equals(TradeReview.key(checked.get(next)))) {
+                if (row.excluded && row.signal.action.sideOnly()) return false;
+                kept.add(row);
+                next++;
+            }
+        }
+        if (next < checked.size()) return false;
+        List<Rules.Signal> accepted = kept.stream().map(row -> row.signal).collect(Collectors.toList());
+        State before = read(db, portfolio);
+        Map<String, LeaderHistory.Holding> prior = replay(db, portfolio);
+        long revision = revision(db, portfolio) + 1;
+        Set<String> legs = new LinkedHashSet<>();
+        for (Record row : observed) {
+            boolean include = kept.contains(row);
+            if (include != row.excluded) continue;
+            ContentValues change = new ContentValues();
+            change.put("excluded_revision", include ? 0 : revision);
+            if (include) change.put("included_revision", revision);
+            db.update("trades", change, "portfolio=? AND event=?", new String[]{portfolio, row.signal.id});
+            legs.add(row.signal.leg());
+        }
+        if (!legs.isEmpty()) {
+            Map<String, LeaderHistory.Holding> latest = new LinkedHashMap<>(before.holdings);
+            Map<String, LeaderHistory.Holding> corrected = replay(db, portfolio);
+            for (String leg : legs) {
+                if (visibleSize(prior, leg).compareTo(visibleSize(latest, leg)) != 0) continue;
+                if (corrected.containsKey(leg)) latest.put(leg, corrected.get(leg));
+                else latest.remove(leg);
+            }
+            List<Rules.Signal> window = TradeReview.replace(before.window,
+                    Collections.singletonMap(review.stamp, accepted), null);
+            ContentValues values = new ContentValues();
+            values.put("snapshot", LocalData.signalJson(window).toString());
+            values.put("estimate", holdingsJson(latest));
+            db.update("leader", values, "portfolio=?", new String[]{portfolio});
+        }
+        saveBaselineCount(db, portfolio, review.stamp, review.sample, accepted);
+        return true;
+    }
+
     boolean hasArchivedRepeats(String portfolio) {
         try (Cursor row = getReadableDatabase().rawQuery("SELECT 1 FROM trades WHERE portfolio=? AND ordinal>=? "
-                + "AND excluded_revision=0 GROUP BY stamp,symbol,action,price,quantity,turnover,pnl "
+                + "AND excluded_revision=0 AND NOT EXISTS (SELECT 1 FROM trade_reviews r "
+                + "WHERE r.portfolio=trades.portfolio AND r.stamp=trades.stamp AND r.provisional=2) "
+                + "GROUP BY stamp,symbol,action,price,quantity,turnover,pnl "
                 + "HAVING COUNT(*)>1 AND SUM(kind IN (1,3,4))>0 LIMIT 1",
                 new String[]{portfolio, Long.toString(firstCurrentOrdinal(getReadableDatabase(), portfolio))})) {
             return row.moveToFirst();
@@ -615,6 +806,36 @@ final class LeaderArchive extends SQLiteOpenHelper {
         return TradeReview.replace(rows, verified, margin);
     }
 
+    List<Rules.Signal> normalizeArchiveOverlap(String portfolio, State state, List<Rules.Signal> rows, BigDecimal margin)
+            throws JSONException {
+        rows = normalizeProvisional(portfolio, normalizeReviewedDuplicates(portfolio, rows, margin), margin);
+        if (!state.historyComplete || state.latest() == null) return rows;
+        long tail = state.latest().time;
+        SQLiteDatabase db = getReadableDatabase();
+        long first = firstCurrentOrdinal(db, portfolio);
+        Map<Long, List<Rules.Signal>> archived = new LinkedHashMap<>();
+        for (Map.Entry<Long, List<Rules.Signal>> group : TradeReview.repeatedSeconds(rows).entrySet()) {
+            if (group.getKey() >= tail) continue;
+            List<Rules.Signal> known = confirmedAt(db, portfolio, group.getKey(), first);
+            if (known.size() < group.getValue().size() && TradeReview.compatible(known, group.getValue())) {
+                // An overlapping second older than the tail cannot add another copy to this session.
+                archived.put(group.getKey(), known);
+            }
+        }
+        return TradeReview.replace(rows, archived, margin);
+    }
+
+    long reviewFromArchiveTail(String portfolio, State state, List<Rules.Signal> rows) {
+        long tail = state.latest().time;
+        SQLiteDatabase db = getReadableDatabase();
+        List<Rules.Signal> known = confirmedAt(db, portfolio, tail, firstCurrentOrdinal(db, portfolio));
+        if (!TradeReview.same(known, TradeReview.at(rows, tail))) return tail;
+        try (Cursor found = db.rawQuery("SELECT 1 FROM trades WHERE portfolio=? AND stamp=? "
+                + "AND kind=-2 AND excluded_revision=0 LIMIT 1", new String[]{portfolio, Long.toString(tail)})) {
+            return found.moveToFirst() ? tail : tail + 1;
+        }
+    }
+
     int confirmClosedPositionReviews(String portfolio, List<Rules.Signal> rows,
             List<ClosedTradeReview.Position> positions) throws JSONException {
         if (positions.isEmpty()) return 0;
@@ -623,15 +844,26 @@ final class LeaderArchive extends SQLiteOpenHelper {
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
         try {
+            List<Review> provisional = provisionalReviews(portfolio);
             List<Rules.Signal> archived = new ArrayList<>();
             try (Cursor found = db.rawQuery("SELECT " + TRADE_COLUMNS + " FROM trades WHERE portfolio=? "
-                    + "AND ordinal>=? AND stamp BETWEEN ? AND ? AND excluded_revision=0 ORDER BY stamp,ordinal",
+                    + "AND ordinal>=? AND stamp BETWEEN ? AND ? AND (excluded_revision=0 OR "
+                    + "(excluded_revision=-1 AND stamp IN (SELECT stamp FROM trade_reviews WHERE portfolio=? AND provisional=1))) "
+                    + "ORDER BY stamp,ordinal",
                     new String[]{portfolio, Long.toString(firstCurrentOrdinal(db, portfolio)),
-                            Long.toString(first), Long.toString(last)})) {
+                            Long.toString(first), Long.toString(last), portfolio})) {
                 while (found.moveToNext()) archived.add(record(found).signal);
             }
-            int repaired = saveClosedPositionReviews(db, portfolio, archived, positions);
-            repaired += saveClosedPositionReviews(db, portfolio, rows, positions);
+            Map<Long, List<Rules.Signal>> proof = ClosedTradeReview.confirmedCounts(archived, positions);
+            int repaired = 0;
+            Set<Long> held = new HashSet<>();
+            for (Review review : provisional) {
+                held.add(review.stamp);
+                List<Rules.Signal> checked = proof.get(review.stamp);
+                if (checked != null && resolveProvisionalReview(db, portfolio, review, checked, true)) repaired++;
+            }
+            repaired += saveClosedPositionReviews(db, portfolio, archived, positions, held);
+            repaired += saveClosedPositionReviews(db, portfolio, rows, positions, held);
             db.setTransactionSuccessful();
             return repaired;
         } finally {
@@ -640,10 +872,15 @@ final class LeaderArchive extends SQLiteOpenHelper {
     }
 
     private int saveClosedPositionReviews(SQLiteDatabase db, String portfolio, List<Rules.Signal> source,
-            List<ClosedTradeReview.Position> positions) throws JSONException {
+            List<ClosedTradeReview.Position> positions, Set<Long> held) throws JSONException {
         int repaired = 0;
-        for (Map.Entry<Long, List<Rules.Signal>> entry : ClosedTradeReview.corrections(source, positions).entrySet()) {
+        for (Map.Entry<Long, List<Rules.Signal>> entry : ClosedTradeReview.confirmedCounts(source, positions).entrySet()) {
             long stamp = entry.getKey();
+            if (held.contains(stamp)) continue;
+            try (Cursor proof = db.rawQuery("SELECT 1 FROM trade_reviews WHERE portfolio=? AND stamp=? AND provisional=2",
+                    new String[]{portfolio, Long.toString(stamp)})) {
+                if (proof.moveToFirst()) continue;
+            }
             List<Rules.Signal> checked = entry.getValue();
             List<Rules.Signal> prior = confirmedAt(db, portfolio, stamp);
             if (!prior.isEmpty() && !TradeReview.compatible(prior, checked)) continue;
@@ -659,9 +896,18 @@ final class LeaderArchive extends SQLiteOpenHelper {
         return repaired;
     }
 
-    // 只有本轮或已落库的证据能与当前样本对齐时，才用已核对的整秒替换可疑记录。
     List<Rules.Signal> verifiedRows(String portfolio, List<Rules.Signal> raw, BigDecimal margin,
             Map<Long, List<Rules.Signal>> justChecked) throws Exception {
+        return verifiedRows(portfolio, raw, margin, justChecked, Long.MIN_VALUE);
+    }
+
+    List<Rules.Signal> verifiedRows(String portfolio, List<Rules.Signal> raw, BigDecimal margin,
+            Map<Long, List<Rules.Signal>> justChecked, long reviewFrom) throws Exception {
+        return verifiedRows(portfolio, raw, margin, justChecked, reviewFrom, Collections.emptySet());
+    }
+
+    List<Rules.Signal> verifiedRows(String portfolio, List<Rules.Signal> raw, BigDecimal margin,
+            Map<Long, List<Rules.Signal>> justChecked, long reviewFrom, Set<Long> provisional) throws Exception {
         Map<Long, List<Rules.Signal>> verified = new LinkedHashMap<>();
         for (Map.Entry<Long, List<Rules.Signal>> entry : justChecked.entrySet()) {
             long stamp = entry.getKey();
@@ -673,10 +919,12 @@ final class LeaderArchive extends SQLiteOpenHelper {
             verified.put(stamp, checked);
         }
         for (Map.Entry<Long, List<Rules.Signal>> entry : TradeReview.repeatedSeconds(raw).entrySet()) {
-            if (verified.containsKey(entry.getKey())) continue;
-            try (Cursor row = getReadableDatabase().rawQuery("SELECT sample,checked FROM trade_reviews WHERE portfolio=? AND stamp=?",
+            if (entry.getKey() < reviewFrom || verified.containsKey(entry.getKey()) || provisional.contains(entry.getKey())) continue;
+            try (Cursor row = getReadableDatabase().rawQuery("SELECT sample,checked,provisional FROM trade_reviews WHERE portfolio=? AND stamp=?",
                     new String[]{portfolio, Long.toString(entry.getKey())})) {
-                if (!row.moveToFirst() || row.isNull(1)) throw WebsiteCapture.reviewFailure("仍需独立核对这组成交");
+                if (!row.moveToFirst()) throw WebsiteCapture.reviewFailure("仍需独立核对这组成交");
+                if (row.getInt(2) != 0) continue;
+                if (row.isNull(1)) throw WebsiteCapture.reviewFailure("仍需独立核对这组成交");
                 List<Rules.Signal> checked = readReviewRows(row.getString(1));
                 if (!TradeReview.same(entry.getValue(), readReviewRows(row.getString(0)))
                         && !TradeReview.same(entry.getValue(), checked)) {
@@ -764,7 +1012,6 @@ final class LeaderArchive extends SQLiteOpenHelper {
         return changed > 0;
     }
 
-    // 用修订号标记已证实的重复历史行。保留原序号，便于已有账本按自己的水位对比修订前后的仓位。
     private int correctHistoricalTrades(SQLiteDatabase db, String portfolio, long stamp, List<Rules.Signal> checked,
             boolean allowBaseline, long first) throws JSONException {
         List<Record> records = confirmedRecords(db, portfolio, stamp, first);
@@ -812,7 +1059,7 @@ final class LeaderArchive extends SQLiteOpenHelper {
     long revision(String portfolio) { return revision(getReadableDatabase(), portfolio); }
 
     private static long revision(SQLiteDatabase db, String portfolio) {
-        try (Cursor row = db.rawQuery("SELECT COALESCE(MAX(excluded_revision),0) FROM trades WHERE portfolio=?",
+        try (Cursor row = db.rawQuery("SELECT COALESCE(MAX(MAX(excluded_revision,included_revision)),0) FROM trades WHERE portfolio=?",
                 new String[]{portfolio})) {
             return row.moveToFirst() ? row.getLong(0) : 0;
         }
@@ -840,8 +1087,9 @@ final class LeaderArchive extends SQLiteOpenHelper {
         SQLiteDatabase db = getReadableDatabase();
         long first = Math.max(-backfilled, firstCurrentOrdinal(db, portfolio));
         try (Cursor trades = db.rawQuery("SELECT " + TRADE_COLUMNS + " FROM trades "
-                + "WHERE portfolio=? AND ordinal>=? AND ordinal<=? AND (excluded_revision=0 OR excluded_revision>?) ORDER BY ordinal",
-                new String[]{portfolio, Long.toString(first), Long.toString(cursor), Long.toString(revision)})) {
+                + "WHERE portfolio=? AND ordinal>=? AND ordinal<=? AND (excluded_revision=0 OR excluded_revision>?) "
+                + "AND included_revision<=? ORDER BY ordinal",
+                new String[]{portfolio, Long.toString(first), Long.toString(cursor), Long.toString(revision), Long.toString(revision)})) {
             while (trades.moveToNext()) {
                 Rules.Signal signal = record(trades).signal;
                 if (signal.action.sideOnly()) {
@@ -911,13 +1159,21 @@ final class LeaderArchive extends SQLiteOpenHelper {
         return capture(portfolio, name, rows, now, historyEnded, pagingDetail, recoveryRead, 0);
     }
 
-    /**
-     * 在同一事务中写入成交、推算仓位、档案水位及组合会话。
-     * 首次基线用于建档，补录历史用独立序号排在既有档案之前，水位之后新增的成交供账本消费。
-     * 会话切换或从空档恢复时可建立新段，日常轮询接不上则保留候选并标记缺口。
-     */
     Update capture(String portfolio, String name, List<Rules.Signal> rows, long now,
             boolean historyEnded, String pagingDetail, boolean recoveryRead, long selection) throws JSONException {
+        return capture(portfolio, name, rows, now, historyEnded, pagingDetail, recoveryRead, selection, false);
+    }
+
+    Update capture(String portfolio, String name, List<Rules.Signal> rows, long now,
+            boolean historyEnded, String pagingDetail, boolean recoveryRead, long selection, boolean joinedArchive)
+            throws JSONException {
+        return capture(portfolio, name, rows, now, historyEnded, pagingDetail, recoveryRead, selection,
+                joinedArchive, Collections.emptyMap());
+    }
+
+    Update capture(String portfolio, String name, List<Rules.Signal> rows, long now, boolean historyEnded,
+            String pagingDetail, boolean recoveryRead, long selection, boolean joinedArchive,
+            Map<Long, List<Rules.Signal>> provisional) throws JSONException {
         if (!rows.isEmpty()) LeaderHistory.verify(rows);
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
@@ -928,7 +1184,10 @@ final class LeaderArchive extends SQLiteOpenHelper {
             boolean switched = selection > 0 && selection != selectionColumn(db, portfolio, "verified_selection");
             boolean returningFromEmpty = before.head > 0 && before.window.isEmpty();
             boolean trustedEmpty = returningFromEmpty && selectionColumn(db, portfolio, "trusted_empty") != 0;
-            if ((switched || (returningFromEmpty && !trustedEmpty)) && !historyEnded) {
+            if (joinedArchive && (!before.historyComplete || before.window.isEmpty() || rows.isEmpty())) {
+                throw new LeaderHistory.Gap();
+            }
+            if ((switched || (returningFromEmpty && !trustedEmpty)) && !historyEnded && !joinedArchive) {
                 throw new IllegalArgumentException("本次跟单需要完整展开官网成交记录");
             }
             if (rows.isEmpty()) {
@@ -951,8 +1210,10 @@ final class LeaderArchive extends SQLiteOpenHelper {
             String historyDetail = expanding ? pagingDetail : before.historyDetail;
             List<Rules.Signal> reference = captureReference(db, portfolio, before);
             LeaderHistory.Merge merge;
-            try { merge = LeaderHistory.merge(reference, rows, expanding || switched || recoveryRead || returningFromEmpty, !before.orderedSnapshot); }
+            try { merge = LeaderHistory.merge(reference, rows,
+                    expanding || switched || recoveryRead || returningFromEmpty || joinedArchive, !before.orderedSnapshot); }
             catch (LeaderHistory.Gap gap) {
+                if (joinedArchive) throw gap;
                 long cutoff = reference.get(reference.size() - 1).time;
                 if (switched || returningFromEmpty) {
                     List<Rules.Signal> newSegment = new ArrayList<>();
@@ -1016,10 +1277,30 @@ final class LeaderArchive extends SQLiteOpenHelper {
                 }
             }
             long head = before.head;
+            Set<String> deferred = new HashSet<>();
+            if (baseline && historyEnded) {
+                for (Map.Entry<Long, List<Rules.Signal>> group : provisional.entrySet()) {
+                    List<Rules.Signal> raw = TradeReview.at(rows, group.getKey());
+                    if (raw.isEmpty()) continue;
+                    Set<String> accepted = group.getValue().stream().map(row -> row.id).collect(Collectors.toSet());
+                    for (Rules.Signal row : raw) if (!accepted.contains(row.id)) deferred.add(row.id);
+                    ContentValues values = new ContentValues();
+                    values.put("portfolio", portfolio);
+                    values.put("stamp", group.getKey());
+                    values.put("sample", LocalData.signalJson(raw).toString());
+                    values.put("provisional", 1);
+                    db.insertWithOnConflict("trade_reviews", null, values, SQLiteDatabase.CONFLICT_REPLACE);
+                }
+            }
             for (Rules.Signal row : added) {
                 Rules.Signal archived = putTrade(db, portfolio, row, ++head, baseline ? 1 : 0, now);
                 if (archived != row) Collections.replaceAll(rows, row, archived);
-                LeaderHistory.apply(holdings, archived);
+                if (deferred.remove(row.id)) {
+                    ContentValues hidden = new ContentValues();
+                    hidden.put("excluded_revision", -1);
+                    db.update("trades", hidden, "portfolio=? AND event=?", new String[]{portfolio, archived.id});
+                    rows.remove(archived);
+                } else LeaderHistory.apply(holdings, archived);
             }
             if (switched || returningFromEmpty) {
                 long first = returningFromEmpty ? firstRetainedOrdinal(db, portfolio, rows, before.head) : 0;
@@ -1088,7 +1369,7 @@ final class LeaderArchive extends SQLiteOpenHelper {
     private static List<Rules.Signal> captureReference(SQLiteDatabase db, String portfolio, State before) {
         if (before.head == 0) return before.window;
         if (before.window.isEmpty()) {
-            // 4.2.2 曾用空页覆盖快照。逐笔档案仍在，从最后一组已确认成交恢复衔接依据。
+            // A 4.2.2 empty switch replaced the window but left the confirmed journal intact.
             try (Cursor last = db.rawQuery("SELECT stamp FROM trades WHERE portfolio=? AND ordinal<=? "
                     + "AND excluded_revision=0 ORDER BY ordinal DESC LIMIT 1",
                     new String[]{portfolio, Long.toString(before.head)})) {

@@ -12,7 +12,6 @@ import android.net.Uri;
 import android.provider.Settings;
 import android.service.notification.StatusBarNotification;
 
-/** 将持续的服务状态、已确认成交和官网划转交给独立的 Android 通知频道。 */
 final class Notices {
     static final int AUTO_ID = 932;
     private static final String RUN = "copy_running";
@@ -109,7 +108,6 @@ final class Notices {
                 && context.getPackageName().equals(sound.getAuthority());
     }
 
-    // 沿用系统通知权限、静音和勿扰设置。应用播放内置提示音时先静默投递，避免系统和应用同时播放。
     private static boolean event(Context context, String channel, String channelTitle, String id, String title,
             String text, boolean sound, boolean onlyOnce) {
         NotificationManager manager = context.getSystemService(NotificationManager.class);

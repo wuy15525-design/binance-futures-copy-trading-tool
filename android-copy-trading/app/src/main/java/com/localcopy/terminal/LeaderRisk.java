@@ -13,10 +13,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 
-/**
- * 按全仓情景估算带单仓位的强平边界，求解时固定其他合约的参考价。
- * 缺少余额、标记价或维持保证金档位时记录使用的假设，供界面标明估算口径。
- */
 final class LeaderRisk {
     static final BigDecimal REFERENCE_RATE = new BigDecimal("0.005");
     static final BigDecimal REFERENCE_LEVERAGE = BigDecimal.valueOf(20);

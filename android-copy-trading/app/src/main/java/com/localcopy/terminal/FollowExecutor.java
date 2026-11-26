@@ -18,10 +18,6 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import org.json.JSONObject;
 
-/**
- * 把账本意向换算为交易所委托，并用已核对的订单和账户成交推进账本。
- * 可通过 Exchange 注入模拟回执，离线验证订单重试和恢复。
- */
 final class FollowExecutor {
     interface Exchange {
         FuturesApi.Wallet wallet() throws Exception;
@@ -41,8 +37,12 @@ final class FollowExecutor {
         }
         int currentLeverage(String symbol) throws Exception;
         int changeLeverage(String symbol, int leverage) throws Exception;
+        default void submit(String symbol, Rules.Action action, boolean hedge, BigDecimal quantity,
+                BigDecimal limit, String id) throws Exception {
+            submit(symbol, action, hedge, quantity, limit, id, false);
+        }
         void submit(String symbol, Rules.Action action, boolean hedge, BigDecimal quantity,
-                BigDecimal limit, String id) throws Exception;
+                BigDecimal limit, String id, boolean fullFill) throws Exception;
         JSONObject order(String symbol, String id) throws Exception;
         FuturesApi.Fills fills(String symbol, long orderId) throws Exception;
         List<FuturesApi.AccountTrade> tradesSince(String symbol, long since) throws Exception;
@@ -61,6 +61,9 @@ final class FollowExecutor {
     private static final long LOST_ORDER_GRACE_MS = 30000;
     private static final long CHECK_RETRY_MS = 3000;
     private static final long MAX_COPY_CHECK_AGE = 10000;
+    private static final long IOC_RETRY_MS = 5000;
+    private static final String LIMIT_UNFILLED = "上一笔限价委托已确认未成交，稍后按最新盘口重试";
+    private static final String FULL_FILL_UNFILLED = "盘口未能整笔成交，等待足量盘口使均价回到范围";
     private final FollowBook book;
     private final Exchange api;
     private final Save save;
@@ -72,6 +75,7 @@ final class FollowExecutor {
     private final Map<String, FuturesApi.Contract> contracts = new HashMap<>();
     private long catalogAt, walletRevision;
     private final Map<String, CopyRetry> copyRetries = new HashMap<>();
+    private final Map<String, CopyLeverageCap> copyLeverageCaps = new HashMap<>();
     private volatile CopyChecks copyChecks;
 
     FollowExecutor(FollowBook book, Exchange api, Save save, Notify notify) {
@@ -146,7 +150,6 @@ final class FollowExecutor {
         syncAccount(api.positions(), at);
     }
 
-    // 有在途委托时由原单核对解释仓位变化，常规同步先停下来，避免误记为手动成交。
     boolean syncAccount(Map<String, FuturesApi.Position> positions, long at) throws Exception {
         if (!allowManual || book.pending != null) return false;
         boolean changed = !book.accountSeeded;
@@ -215,7 +218,14 @@ final class FollowExecutor {
         leg.observedAt = at;
     }
 
-    // 优先核对减仓。委托依赖有效快照，加仓还受开仓开关、盘口、价差、杠杆和保证金约束。
+    private Set<String> reviewingLegs = Collections.emptySet();
+
+    void holdTradeReviews(Set<String> legs) { reviewingLegs = legs; }
+
+    private boolean reviewing(FollowBook.Leg leg) {
+        return reviewingLegs.contains(leg.symbol + "|" + (leg.isLong ? "LONG" : "SHORT"));
+    }
+
     String decide(Rules.Config current, BooleanSupplier canTrade, BooleanSupplier canOpen) throws Exception {
         if (book.pending != null) return "等待核对原委托号";
         boolean copy = book.strategy == Rules.Strategy.EXPOSURE;
@@ -223,7 +233,7 @@ final class FollowExecutor {
         String wait = "等待名单内的新成交";
         List<FollowBook.Leg> legs = new ArrayList<>(book.legs.values());
         for (FollowBook.Leg leg : legs) {
-            if (!leg.needsReduction()) continue;
+            if (!leg.needsReduction() || reviewing(leg)) continue;
             if (!canTrade.getAsBoolean()) return "等待有效官网快照，未发平仓委托";
             try {
                 long checkedAt = System.currentTimeMillis();
@@ -282,7 +292,7 @@ final class FollowExecutor {
                 boolean hedge = api.hedgeMode();
                 if (!canTrade.getAsBoolean()) return "本轮停止前未发送平仓委托";
                 BigDecimal otherSide = leg.isLong ? actual.shorts : actual.longs;
-                return send(leg, close, hedge, quantity, null, null, otherSide, 0, checkedAt, canTrade, false);
+                return send(leg, close, hedge, quantity, null, null, otherSide, 0, checkedAt, canTrade, false, false);
             } catch (FuturesApi.UnavailableSymbol unavailable) {
                 wait = unavailable.getMessage();
             } catch (FuturesApi.Failure failure) {
@@ -296,12 +306,24 @@ final class FollowExecutor {
         if (!adjusting.message.isEmpty()) wait = adjusting.message;
         if (!permitOpen.getAsBoolean()) return "暂停开仓，继续核对平仓信号";
         for (FollowBook.Leg leg : legs) {
-            if (leg.entries.isEmpty() || leg.needsReduction() || leg.adjusting()) continue;
+            if (leg.entries.isEmpty() || reviewing(leg)) continue;
+            if (leg.needsReduction() || leg.adjusting()) {
+                String reason = leg.needsReduction() ? "等待同方向减仓核对" : "等待同方向复制目标核对";
+                for (FollowBook.Entry entry : leg.entries) {
+                    if (!entry.cancelled) recordOpenWait(entry, reason);
+                }
+                continue;
+            }
             if (!permitOpen.getAsBoolean()) return "新开仓会等下一次有效快照";
             for (Iterator<FollowBook.Entry> entries = leg.entries.iterator(); entries.hasNext();) {
                 FollowBook.Entry entry = entries.next();
                 if (entry.cancelled || !waitActive.test(entry.id())) continue;
-                if (entry.waitingForCheckRetry(System.currentTimeMillis())) {
+                long now = System.currentTimeMillis();
+                if (recentlyUnfilled(entry.lastUnfilled, now)) {
+                    wait = leg.symbol + " " + entry.waitReason;
+                    continue;
+                }
+                if (entry.waitingForCheckRetry(now)) {
                     wait = entry.signal.symbol + " 开仓检查待重试 · 最早 " + TradeNotice.time(entry.checkRetryAt);
                     continue;
                 }
@@ -314,6 +336,7 @@ final class FollowExecutor {
                     BigDecimal multiple = copy ? entry.signal.exposureRatio() : null;
                     if (copy && multiple == null && entry.nominalLeft == null) {
                         wait = symbol + " 等待开仓成交额或带单保证金余额";
+                        recordOpenWait(entry, wait);
                         continue;
                     }
                     if (entry.existing && leg.protectedExisting) {
@@ -329,7 +352,7 @@ final class FollowExecutor {
                     catch (IllegalArgumentException unsupported) {
                         wait = unsupported instanceof FuturesApi.UnavailableSymbol ? unsupported.getMessage()
                                 : symbol + " 此环境无可交易的该合约";
-                        clearCheckRetry(entry);
+                        recordOpenWait(entry, wait);
                         break;
                     }
                     String endReason = unfillableRemainder(entry, contract, rule.leverage);
@@ -344,12 +367,20 @@ final class FollowExecutor {
                         commit();
                         continue;
                     }
-                    BigDecimal boundary = Rules.entryLimit(action, entry.referencePrice(), rule.slippagePercent, contract.tick);
+                    if (book.leaderAveragesVerified && leg.leaderAverage == null) {
+                        wait = symbol + " 等待核对带单仓位均价";
+                        recordOpenWait(entry, wait);
+                        continue;
+                    }
+                    BigDecimal leaderAverage = leg.leaderAverage;
+                    BigDecimal slippage = entry.usesAdjustmentSlippage() ? book.copySlippage : rule.slippagePercent;
+                    BigDecimal boundary = leaderAverage == null
+                            ? Rules.entryLimit(action, entry.referencePrice(), slippage, contract.tick) : null;
                     stage = "开仓检查（盘口）";
                     Rules.Quote quote = api.quote(symbol);
-                    if (!Rules.acceptable(action, boundary, quote)) {
+                    if (boundary != null && !Rules.acceptable(action, boundary, quote)) {
                         wait = symbol + " 不利价差超限，继续等待";
-                        clearCheckRetry(entry);
+                        recordOpenWait(entry, wait);
                         continue;
                     }
                     stage = "开仓检查（持仓模式）";
@@ -362,7 +393,7 @@ final class FollowExecutor {
                     } else verifyPosition(symbol, venue);
                     if (!hedge && (leg.isLong ? venue.shorts : venue.longs).signum() > 0) {
                         wait = symbol + " 单向持仓模式下有反向仓位，等待平仓";
-                        clearCheckRetry(entry);
+                        recordOpenWait(entry, wait);
                         continue;
                     }
                     stage = "开仓检查（保证金余额）";
@@ -378,7 +409,7 @@ final class FollowExecutor {
                     if (!copy && budget == null) budget = rule.orderMargin(wallet.balance).multiply(entry.fraction, MC);
                     if ((copy ? nominal : budget).signum() <= 0) {
                         wait = symbol + " 本账户保证金余额不足，继续等待";
-                        clearCheckRetry(entry);
+                        recordOpenWait(entry, wait);
                         continue;
                     }
                     if (copy && nominal.compareTo(contract.minValue.max(entry.reportedMinimum)) < 0) {
@@ -390,7 +421,7 @@ final class FollowExecutor {
                     int heldLeverage = venue.flat() ? 0 : api.currentLeverage(symbol);
                     if (!venue.flat() && heldLeverage < 1) {
                         wait = symbol + " 当前持仓杠杆待核对";
-                        clearCheckRetry(entry);
+                        recordOpenWait(entry, wait);
                         continue;
                     }
                     int sizing = venue.flat() ? rule.leverage : Math.min(rule.leverage, heldLeverage);
@@ -407,20 +438,31 @@ final class FollowExecutor {
                     }
                     if (leverage < Math.max(1, heldLeverage)) {
                         wait = symbol + " 持仓及本单金额超过杠杆档位的名义价值上限";
-                        recordIssue(entry, wait);
+                        recordOpenWait(entry, wait);
                         continue;
                     }
                     if (copy) budget = nominal.divide(BigDecimal.valueOf(leverage), MC);
                     Offer offer = offer(entry, quote, wallet, contract, boundary, budget,
-                            copy || venue.flat() ? leverage : sizing, nominal);
+                            copy || venue.flat() ? leverage : sizing, leverage, nominal);
                     if (offer.quantity.signum() == 0) {
                         wait = symbol + " " + offer.wait;
                         if (copy && offer.tooSmall) {
                             wait = deferOpeningCopy(leg, entry, wait);
                             break;
                         }
-                        clearCheckRetry(entry);
+                        recordOpenWait(entry, wait);
                         continue;
+                    }
+                    boolean fullFill = false;
+                    if (leaderAverage != null) {
+                        String issue = Rules.openingAverageIssue(action, venue, offer.quantity, offer.price,
+                                leaderAverage, slippage);
+                        if (!issue.isEmpty()) {
+                            wait = symbol + " " + issue;
+                            recordOpenWait(entry, wait);
+                            continue;
+                        }
+                        fullFill = Rules.openingNeedsFullFill(action, venue, leaderAverage, slippage);
                     }
                     if (!canSend.getAsBoolean()) return "本轮未发开仓委托";
                     stage = "查询当前杠杆";
@@ -429,8 +471,9 @@ final class FollowExecutor {
                         FuturesApi.Position rechecked = api.position(symbol);
                         if (!rechecked.flat()) {
                             if (syncPosition(symbol, rechecked, recheckedAt)) commit();
-                            clearCheckRetry(entry);
-                            return symbol + " 已有持仓，下一轮沿用实际杠杆";
+                            wait = symbol + " 已有持仓，下一轮沿用实际杠杆";
+                            recordOpenWait(entry, wait);
+                            return wait;
                         }
                         if (!canSend.getAsBoolean()) return "本轮未调整杠杆";
                         stage = "调整杠杆";
@@ -440,9 +483,15 @@ final class FollowExecutor {
                                 + (confirmed < rule.leverage ? "（预设 " + rule.leverage + " 倍）" : "");
                         entry.clearCheckRetry();
                         entry.requestIssue = "";
+                        entry.waitReason = "杠杆已确认，下轮检查最新盘口";
                         book.log(message);
                         commit();
                         return message + "，下轮检查最新盘口";
+                    }
+                    if (leaderAverage != null && !venue.sameOpeningBasis(api.position(symbol), action)) {
+                        wait = symbol + " 本账户仓位或均价已变化，下轮重算";
+                        recordOpenWait(entry, wait);
+                        continue;
                     }
                     if (entry.remaining == null || copy) {
                         entry.margin = offer.budget;
@@ -454,10 +503,10 @@ final class FollowExecutor {
                     stage = "开仓";
                     BigDecimal otherSide = leg.isLong ? venue.shorts : venue.longs;
                     return send(leg, action, hedge, offer.quantity, offer.price, entry, otherSide,
-                            leverage, checkedAt, canSend, false);
+                            leverage, checkedAt, canSend, false, fullFill);
                 } catch (FuturesApi.UnavailableSymbol unavailable) {
                     wait = unavailable.getMessage();
-                    clearCheckRetry(entry);
+                    recordOpenWait(entry, wait);
                     break;
                 } catch (FuturesApi.Failure failure) {
                     if (book.pending == null && retryableCheck(failure)) {
@@ -480,7 +529,7 @@ final class FollowExecutor {
             }
         }
         if ("等待名单内的新成交".equals(wait) && legs.stream().anyMatch(leg -> leg.adjustOnSignal)) {
-            return "复制调仓等待对应方向下一笔带单成交";
+            return "复制目标等待对应方向下一笔带单成交";
         }
         return wait;
     }
@@ -513,17 +562,24 @@ final class FollowExecutor {
         List<String> messages = new ArrayList<>();
         Set<String> attempted = new LinkedHashSet<>();
         for (FollowBook.Leg leg : book.legs.values()) {
-            if (leg.adjustment == null || leg.adjustOnSignal || leg.needsReduction()) continue;
-            CopyPlan.Request request = new CopyPlan.Request(book, leg, current.rule(leg.symbol), walletRevision);
+            if (leg.adjustment == null || leg.adjustOnSignal || leg.needsReduction() || reviewing(leg)) continue;
+            if (recentlyUnfilled(leg.adjustment.lastUnfilled, System.currentTimeMillis())) {
+                messages.add(leg.symbol + " " + leg.adjustment.waitReason);
+                continue;
+            }
+            CopyPlan.Request request = new CopyPlan.Request(book, leg, current.rule(leg.symbol),
+                    walletRevision, confirmedCopyLeverage(leg.symbol));
             if (!waitActive.test(leg.adjustment.id())) {
                 messages.add(request.label + "等待取消确认");
                 continue;
             }
             if (leg.adjustment.leaderMargin() == null) {
-                messages.add(request.label + "等待带单保证金余额");
+                String reason = request.label + "等待带单保证金余额";
+                messages.add(reason);
+                recordCopyWait(leg, reason);
                 continue;
             }
-            if (!canTrade.getAsBoolean()) return new AdjustmentStep("等待有效官网快照，暂缓复制调仓");
+            if (!canTrade.getAsBoolean()) return new AdjustmentStep("等待有效官网快照，暂缓复制委托");
             revisions.put(request.key, request.revision);
             requests.add(request);
         }
@@ -550,7 +606,10 @@ final class FollowExecutor {
                 AdjustmentStep step = applyCopyPlan(leg, plan, canTrade, canOpen);
                 copyRetries.remove(request.key);
                 if (step.acted) messages.add(0, step.message);
-                else messages.add(step.message);
+                else {
+                    messages.add(step.message);
+                    recordCopyWait(leg, step.message);
+                }
                 acted |= step.acted;
                 if (book.pending != null) break;
             } catch (JournalFailure fatal) {
@@ -559,16 +618,18 @@ final class FollowExecutor {
                 if (book.pending != null || invalidCredentials(problem)
                         || problem instanceof javax.net.ssl.SSLException || problem instanceof InterruptedException) throw problem;
                 attempted.add(request.key);
-                messages.add(copyCheckFailed(request, retry, problem));
+                String issue = copyCheckFailed(request, retry, problem);
+                messages.add(issue);
+                recordCopyWait(leg, issue);
             }
         }
         if (scheduleChecks && copyChecks != null && book.pending == null && canTrade.getAsBoolean()) {
             copyChecks.schedule(requests, attempted, canOpen.getAsBoolean(), FEE_BUFFER);
         }
-        if (scheduleChecks && messages.isEmpty() && !requests.isEmpty()) messages.add("正在按合约检查 " + requests.size() + " 项调仓");
+        if (scheduleChecks && messages.isEmpty() && !requests.isEmpty()) messages.add("正在按合约检查 " + requests.size() + " 项复制委托");
         int shown = Math.min(3, messages.size());
         String summary = String.join("\n", messages.subList(0, shown));
-        if (shown < messages.size()) summary += "\n另外 " + (messages.size() - shown) + " 项调仓";
+        if (shown < messages.size()) summary += "\n另外 " + (messages.size() - shown) + " 项复制委托";
         return new AdjustmentStep(summary, acted);
     }
 
@@ -590,7 +651,7 @@ final class FollowExecutor {
             if (syncPosition(leg.symbol, plan.position, plan.checkedAt)) commit();
             if (leg.protectedExisting && plan.result != CopyPlan.Result.FINISH) {
                 leg.clearAdjustment();
-                String detail = request.label + "启动前仓位暂未纳入跟单，已结束本次调仓";
+                String detail = request.label + "启动前仓位暂未纳入跟单，已结束本次委托";
                 book.log(detail);
                 commit();
                 return new AdjustmentStep(detail);
@@ -628,17 +689,63 @@ final class FollowExecutor {
             if (!permitted.getAsBoolean()) return new AdjustmentStep(request.label + "委托已暂停");
             if (plan.result == CopyPlan.Result.SET_LEVERAGE) {
                 invalidateCopyChecks(leg.symbol);
-                int confirmed = api.changeLeverage(leg.symbol, plan.leverage);
+                int confirmed;
+                try {
+                    confirmed = api.changeLeverage(leg.symbol, plan.leverage);
+                } catch (FuturesApi.Failure rejected) {
+                    int cap = rejected.statedLeverageCap();
+                    if (cap <= 0 || cap >= plan.leverage) throw rejected;
+                    rememberCopyLeverage(leg.symbol, cap);
+                    String detail = request.label + "币安限制为 " + cap + " 倍，按实际杠杆重算";
+                    adjustment.waitReason = detail;
+                    book.log(detail);
+                    commit();
+                    return new AdjustmentStep(detail, true);
+                }
+                if (confirmed < plan.leverage) rememberCopyLeverage(leg.symbol, confirmed);
                 String detail = request.label + "杠杆已确认 " + confirmed + " 倍";
+                adjustment.waitReason = detail;
                 book.log(detail);
                 commit();
                 return new AdjustmentStep(detail, true);
             }
+            if (plan.action.opens && request.leaderAverage != null
+                    && !plan.position.sameOpeningBasis(api.position(leg.symbol), plan.action)) {
+                return new AdjustmentStep(request.label + "本账户仓位或均价已变化，下轮重算");
+            }
             BigDecimal other = leg.isLong ? plan.position.shorts : plan.position.longs;
             return new AdjustmentStep(send(leg, plan.action, plan.hedge, plan.quantity, plan.price,
-                    null, other, plan.leverage, plan.checkedAt, permitted, true), true);
+                    null, other, plan.leverage, plan.checkedAt, permitted, true, plan.fullFill), true);
         }
         return new AdjustmentStep(plan.message);
+    }
+
+    private static boolean recentlyUnfilled(long last, long now) {
+        return last > 0 && now >= last && now - last < IOC_RETRY_MS;
+    }
+
+    private static final class CopyLeverageCap {
+        final int maximum;
+        final long checkedAt = System.currentTimeMillis();
+
+        CopyLeverageCap(int maximum) { this.maximum = maximum; }
+    }
+
+    private int confirmedCopyLeverage(String symbol) {
+        CopyLeverageCap cap = copyLeverageCaps.get(symbol);
+        long age = cap == null ? -1 : System.currentTimeMillis() - cap.checkedAt;
+        return age >= 0 && age < CONTRACT_CACHE_MS ? cap.maximum : Integer.MAX_VALUE;
+    }
+
+    private void rememberCopyLeverage(String symbol, int cap) {
+        copyLeverageCaps.put(symbol, new CopyLeverageCap(Math.min(cap, confirmedCopyLeverage(symbol))));
+    }
+
+    private void recordCopyWait(FollowBook.Leg leg, String reason) throws JournalFailure {
+        if (leg.adjustment != null && !reason.equals(leg.adjustment.waitReason)) {
+            leg.adjustment.waitReason = reason;
+            commit();
+        }
     }
 
     private static boolean positionChangedSince(FollowBook.Leg leg, FuturesApi.Position position, long at) {
@@ -683,7 +790,8 @@ final class FollowExecutor {
     private String deferCopy(FollowBook.Leg leg, String reason) throws Exception {
         leg.resetCopyOrders("");
         leg.adjustOnSignal = leg.leader.signum() > 0 && leg.copied.signum() > 0;
-        if (!leg.adjustOnSignal || leg.adjustment == null || !leg.adjustment.fromSetting()) leg.adjustment = null;
+        if (!leg.adjustOnSignal) leg.clearAdjustment();
+        else if (leg.adjustment == null || !leg.adjustment.fromSetting()) leg.adjustment = null;
         String message = reason + (leg.adjustOnSignal ? " · 下次同方向带单成交重新核算" : "");
         book.log(message);
         commit();
@@ -691,6 +799,12 @@ final class FollowExecutor {
     }
 
     private String deferOpeningCopy(FollowBook.Leg leg, FollowBook.Entry skipped, String reason) throws Exception {
+        for (FollowBook.Entry entry : leg.entries) {
+            if (entry.usesAdjustmentSlippage() && !entry.cancelled && waitActive.test(entry.id())) {
+                leg.deferredAdjustmentSlippage = true;
+                break;
+            }
+        }
         if (!leg.legacyCopyScope) {
             for (int i = leg.entries.size() - 1, first = leg.entries.indexOf(skipped); i > first; i--) {
                 FollowBook.Entry later = leg.entries.get(i);
@@ -748,15 +862,16 @@ final class FollowExecutor {
 
     static Offer offer(FollowBook.Entry entry, Rules.Quote quote, FuturesApi.Wallet wallet,
             FuturesApi.Contract contract, BigDecimal boundary, BigDecimal budget, int leverage) {
-        return offer(entry, quote, wallet, contract, boundary, budget, leverage, null);
+        return offer(entry, quote, wallet, contract, boundary, budget, leverage, leverage, null);
     }
 
     private static Offer offer(FollowBook.Entry entry, Rules.Quote quote, FuturesApi.Wallet wallet,
-            FuturesApi.Contract contract, BigDecimal boundary, BigDecimal budget, int leverage, BigDecimal nominal) {
+            FuturesApi.Contract contract, BigDecimal boundary, BigDecimal budget, int leverage,
+            int actualLeverage, BigDecimal nominal) {
         Rules.Action action = entry.signal.action;
         BigDecimal price = Rules.iocPrice(action, quote, contract.tick);
-        if (!Rules.acceptable(action, boundary, quote) || price.signum() <= 0
-                || (action.isLong ? price.compareTo(boundary) > 0 : price.compareTo(boundary) < 0)) {
+        if (price.signum() <= 0 || (boundary != null
+                && (!Rules.acceptable(action, boundary, quote) || Rules.exceedsOpeningLimit(action, price, boundary)))) {
             return new Offer("不利价差超限，继续等待");
         }
         BigDecimal available = wallet.available.max(ZERO);
@@ -781,20 +896,18 @@ final class FollowExecutor {
         if (quantity.compareTo(entry.rejectedQuantity) <= 0 || value.compareTo(entry.rejectedNotional) <= 0) {
             return new Offer("当前可委托量或金额未超过交易所已拒绝的下限，继续等待", true);
         }
-        BigDecimal usesAndFees = budget.add(notionalBudget.multiply(FEE_BUFFER, MC));
+        // Only the slice sent in this IOC needs available margin now.
+        BigDecimal usesAndFees = value.divide(BigDecimal.valueOf(actualLeverage), MC)
+                .add(value.multiply(FEE_BUFFER, MC));
         if (budget.signum() <= 0 || available.compareTo(usesAndFees) < 0) {
             return new Offer("可用保证金不足，继续等待");
         }
         return new Offer(quantity, price, target, budget, "");
     }
 
-    /**
-     * 发单前先保存唯一委托号和本次参数。写盘期间如果发单条件变化，清除尚未发送的待核对项。
-     * 发送结果无法确认时保留原委托号，让后续轮次或进程重启后继续查询原单。
-     */
     private String send(FollowBook.Leg leg, Rules.Action action, boolean hedge, BigDecimal amount,
             BigDecimal limit, FollowBook.Entry entry, BigDecimal otherSide, int leverage, long checkedAt,
-            BooleanSupplier canSend, boolean adjustment) throws Exception {
+            BooleanSupplier canSend, boolean adjustment, boolean fullFill) throws Exception {
         if (!book.config.symbols.contains(leg.symbol) || book.pending != null) {
             throw new IllegalStateException("跟单状态或合约名单发生变化");
         }
@@ -804,23 +917,38 @@ final class FollowExecutor {
                 .put("qty", Rules.show(amount)).put("hedge", hedge).put("at", System.currentTimeMillis())
                 .put("checkedAt", checkedAt);
         if (limit != null) book.pending.put("limit", Rules.show(limit));
+        if (fullFill) book.pending.put("fullFill", true);
         if (entry != null) {
+            entry.waitReason = "";
+            entry.lastUnfilled = 0;
             book.pending.put("entry", entry.id()).put("leverage", leverage);
         }
         if (adjustment) {
+            leg.adjustment.waitReason = "";
+            leg.adjustment.lastUnfilled = 0;
             book.pending.put("copyAdjustment", leg.adjustment.id()).put("leverage", leverage)
                     .put("copyTarget", Rules.show(leg.adjustment.target));
         }
-        if (book.strategy == Rules.Strategy.EXPOSURE) book.pending.put("copyFactor", Rules.show(book.copyFactor));
+        if (book.strategy == Rules.Strategy.EXPOSURE) {
+            boolean rebalance = adjustment ? leg.adjustment.fromSetting() : entry != null && entry.existing;
+            book.pending.put("copyFactor", Rules.show(book.copyFactor)).put("copyRebalance", rebalance);
+        }
         Rules.Signal source = adjustment ? leg.adjustment.signal : entry == null ? leg.reducingSignal : entry.signal;
         BigDecimal reference = null;
         String label = referenceLabel(entry);
-        if (adjustment && leg.adjustment.fromSetting() && action.opens) {
+        if (adjustment && action.opens && leg.leaderAverage != null) {
+            reference = leg.leaderAverage;
+            label = "带单仓位均价";
+        } else if (adjustment && leg.adjustment.fromSetting() && action.opens) {
             reference = leg.adjustment.reference;
             label = "调仓参考均价";
         } else if (source != null) {
-            reference = entry == null ? source.price : entry.referencePrice();
+            reference = entry != null ? entry.referencePrice(leg.leaderAverage) : source.price;
+            if (action.opens && leg.leaderAverage != null && entry != null && entry.existing) {
+                label = "带单仓位均价";
+            }
         }
+        if (action.opens && leg.leaderAverage != null) book.pending.put("leaderAverage", Rules.show(leg.leaderAverage));
         if (reference != null) book.pending.put("reference", Rules.show(reference)).put("referenceLabel", label);
         if (source != null) {
             BigDecimal ratio = source.exposureRatio();
@@ -839,16 +967,26 @@ final class FollowExecutor {
         try {
             invalidateCopyChecks(leg.symbol);
             walletRevision++;
-            api.submit(leg.symbol, action, hedge, amount, limit, id);
+            api.submit(leg.symbol, action, hedge, amount, limit, id, fullFill);
         } catch (FuturesApi.NotSent notSent) {
             book.pending = null;
             resetUnfilled(entry);
-            if (entry == null) book.log(leg.symbol + " 平仓请求未发送 · " + failureText(notSent));
+            if (entry == null) {
+                String issue = (action.opens ? "开仓" : "平仓") + "请求未发送 · " + failureText(notSent);
+                if (adjustment) leg.adjustment.waitReason = issue;
+                book.log(leg.symbol + " " + issue);
+            }
             commit();
             throw notSent;
         } catch (FuturesApi.Failure failure) {
             if (!failure.definitivelyRejected()) return uncertain("发送结果未确认 · " + failureText(failure));
             book.pending = null;
+            if (fullFill && failure.code == -5021) {
+                resetUnfilled(entry);
+                recordUnfilled(entry, adjustment ? leg.adjustment : null, true, System.currentTimeMillis());
+                commit();
+                return leg.symbol + " " + FULL_FILL_UNFILLED;
+            }
             String detail = (action.opens ? "开仓" : "平仓") + "请求失败 · " + failure.getMessage();
             boolean copyRemainder = book.strategy == Rules.Strategy.EXPOSURE && (entry != null || leg.target.signum() > 0);
             if ((adjustment || copyRemainder) && failure.belowOrderMinimum()) {
@@ -856,9 +994,12 @@ final class FollowExecutor {
                 return entry == null ? deferCopy(leg, leg.symbol + " " + detail)
                         : deferOpeningCopy(leg, entry, leg.symbol + " " + detail);
             }
-            if (entry == null) book.log(leg.symbol + " " + detail);
-            else {
+            if (entry == null) {
+                if (adjustment) leg.adjustment.waitReason = "币安拒单 · " + failure.getMessage();
+                book.log(leg.symbol + " " + detail);
+            } else {
                 resetUnfilled(entry);
+                entry.waitReason = "币安拒单 · " + failure.getMessage();
                 if (failure.belowOrderMinimum()) {
                     contracts.remove(leg.symbol);
                     if (failure.code == -4004) entry.rejectedQuantity = entry.rejectedQuantity.max(amount);
@@ -920,7 +1061,6 @@ final class FollowExecutor {
 
     String reconcile() throws Exception { return reconcile(false); }
 
-    // 查到原单后还需核对成交与仓位。短暂查不到委托时，仍保留账本中的待核对项。
     private String reconcile(boolean stoppedFlat) throws Exception {
         if (book.pending == null) return "当前没有待核对委托";
         JSONObject pending = book.pending;
@@ -1010,7 +1150,13 @@ final class FollowExecutor {
         if (entry != null && entry.existing) sideLabel = leg.isLong ? "补多" : "补空";
         if (fills != null && increase) sideLabel = leg.isLong ? "加多" : "加空";
         if (fills != null && !action.opens && expected.signum() > 0) sideLabel = leg.isLong ? "减多" : "减空";
-        if (adjusting) sideLabel = "复制调仓 " + sideLabel;
+        boolean rebalance = pending.optBoolean("copyRebalance",
+                pending.optString("copyAdjustment").startsWith("adjust-setting|")
+                        || pending.has("copyFactor") && pending.optString("entry").startsWith("existing|"));
+        if (rebalance) {
+            if (entry != null && entry.existing) sideLabel = leg.isLong ? "补多" : "补空";
+            sideLabel = "复制调仓 " + sideLabel;
+        }
         String label = sideLabel + (executed.signum() == 0 ? "未成交" : executed.compareTo(requested) < 0
                 ? "部分成交" : "已成交");
         int leverage = pending.optInt("leverage", book.config.rule(symbol).leverage);
@@ -1026,6 +1172,12 @@ final class FollowExecutor {
             message = TradeNotice.completed(label, symbol, action, fills, remaining, reference,
                     pending.optString("referenceLabel", referenceLabel(entry)));
             if (action.opens) message += "\n实际杠杆 " + leverage + " 倍";
+            BigDecimal leaderAverage = FuturesApi.optionalDecimal(pending, "leaderAverage");
+            BigDecimal accountAverage = position.entryPrice(action);
+            if (leaderAverage != null && accountAverage != null && accountAverage.signum() > 0) {
+                message += "\n成交后持仓均价 " + TradeNotice.price(accountAverage)
+                        + " USDT · 带单仓位均价 " + TradeNotice.price(leaderAverage) + " USDT";
+            }
             BigDecimal multiple = FuturesApi.optionalDecimal(pending, "exposureRatio");
             if (multiple != null) message += "\n带单成交额 / 保证金余额 " + TradeNotice.exposureMultiple(multiple) + " 倍";
             BigDecimal factor = FuturesApi.optionalDecimal(pending, "copyFactor");
@@ -1079,12 +1231,29 @@ final class FollowExecutor {
                 }
             }
         }
+        if (!stoppedFlat && action.opens && pending.has("limit") && executed.signum() == 0) {
+            FollowBook.CopyAdjustment matching = leg.adjustment != null
+                    && leg.adjustment.id().equals(pending.optString("copyAdjustment")) ? leg.adjustment : null;
+            recordUnfilled(entry, matching, pending.optBoolean("fullFill"), checkedAt);
+        }
         book.pending = null;
         book.log(message);
         if (!stoppedFlat && fills != null) book.notice = new JSONObject().put("id", id).put("text", message).put("fill", true);
         commit();
         if (!stoppedFlat) flushNotice();
         return message;
+    }
+
+    private static void recordUnfilled(FollowBook.Entry entry, FollowBook.CopyAdjustment adjustment,
+            boolean fullFill, long checkedAt) {
+        String reason = fullFill ? FULL_FILL_UNFILLED : LIMIT_UNFILLED;
+        if (entry != null) {
+            entry.lastUnfilled = checkedAt;
+            entry.waitReason = reason;
+        } else if (adjustment != null) {
+            adjustment.lastUnfilled = checkedAt;
+            adjustment.waitReason = reason;
+        }
     }
 
     private String referenceLabel(FollowBook.Entry entry) {
@@ -1119,8 +1288,12 @@ final class FollowExecutor {
         if (noteIssue(entry, issue) || cleared) commit();
     }
 
-    private void clearCheckRetry(FollowBook.Entry entry) throws JournalFailure {
-        if (entry.clearCheckRetry()) commit();
+    private void recordOpenWait(FollowBook.Entry entry, String reason) throws JournalFailure {
+        boolean cleared = entry.clearCheckRetry();
+        if (!reason.equals(entry.waitReason) || cleared) {
+            entry.waitReason = reason;
+            commit();
+        }
     }
 
     private static boolean retryableCheck(Exception failure) {

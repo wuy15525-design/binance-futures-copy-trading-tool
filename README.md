@@ -1,8 +1,8 @@
 # 合约跟单台
 
-**4.3.9 · Android 13 及以上 · 币安 U 本位 USDT 永续合约**
+**4.3.17 · Android 13 及以上 · 币安 U 本位 USDT 永续合约**
 
-**[下载 v4.3.9 APK](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/download/v4.3.9/binance-copy-terminal-v4.3.9.apk)** · [查看发布页](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/tag/v4.3.9)
+**[下载 v4.3.17 APK](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/download/v4.3.17/binance-copy-terminal-v4.3.17.apk)** · [查看发布页](https://github.com/wuy15525-design/binance-futures-copy-trading-tool/releases/tag/v4.3.17)
 
 在安卓手机上读取币安带单组合的公开成交记录，按你设置的合约白名单和跟单规则，用自己的币安账户执行委托。支持仅监测、模拟盘演练、模拟盘跟随官网信号和实盘跟单。
 
@@ -10,9 +10,13 @@
 
 ## 源码与构建
 
-在 Android Studio 中打开 `android-copy-trading/`。此目录包含 4.3.9 的 Android 应用、资源、构建脚本和离线测试。[Android 工程与构建说明](android-copy-trading/README.md#构建与检查)
+在 Android Studio 中打开 `android-copy-trading/`。此目录包含 4.3.17 的 Android 应用、资源、构建脚本和离线测试。[Android 工程与构建说明](android-copy-trading/README.md#构建与检查)
 
 ## 更新说明
+
+### v4.3.17
+
+优化了建档去重逻辑以及读取错误处理，解决了价格约束失效问题。
 
 ### v4.3.9
 
@@ -40,7 +44,7 @@
 
 ### 1. 安装并检查通知
 
-点击上方「下载 v4.3.9 APK」获取 `binance-copy-terminal-v4.3.9.apk`。APK 的 SHA-256 为 `4750d3edfa5874aa42283e3dfa77f67a0ee00b21692a4b9afb87d2b843c43a0b`。
+点击上方「下载 v4.3.17 APK」获取 `binance-copy-terminal-v4.3.17.apk`。APK 的 SHA-256 为 `ed8b769b15931fad358930a11edc2e3a24595767faf2da95bb255697405fddf4`。
 
 从旧版更新时，请使用同一签名的发布包覆盖安装，以保留本机档案和设置。打开应用，在「设置 → 后台与通知 → 测试通知与提示音」允许通知并试听。长时间运行前按[网络与后台](#网络与后台)设置手机。
 

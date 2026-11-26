@@ -8,7 +8,6 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
 
-/** 统一成交提醒、仓位数值和盈亏的展示格式。显示舍入与委托数量计算分开。 */
 final class TradeNotice {
     private static final MathContext PRICE_DISPLAY = new MathContext(14, RoundingMode.HALF_UP);
     private static final MathContext SMALL_POSITION_PRICE = new MathContext(4, RoundingMode.HALF_UP);

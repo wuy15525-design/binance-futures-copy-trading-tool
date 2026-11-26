@@ -232,7 +232,28 @@ public final class V3ArchiveTest {
         assertEquals(0, last.kind);
     }
 
+    private static void restoreTradeSchemaWithoutInclusion(SQLiteDatabase db) {
+        boolean indexed;
+        try (Cursor row = db.rawQuery("SELECT 1 FROM sqlite_master WHERE name='trades_detected'", null)) {
+            indexed = row.moveToFirst();
+        }
+        String columns = "portfolio,event,stamp,symbol,action,price,quantity,ordinal,kind,pnl,"
+                + "detected_at,turnover,lead_margin,excluded_revision";
+        db.execSQL("CREATE TABLE old_trades (portfolio TEXT NOT NULL,event TEXT NOT NULL,stamp INTEGER NOT NULL,"
+                + "symbol TEXT NOT NULL,action TEXT NOT NULL,price TEXT NOT NULL,quantity TEXT NOT NULL,"
+                + "ordinal INTEGER,kind INTEGER NOT NULL,pnl TEXT,detected_at INTEGER NOT NULL DEFAULT 0,"
+                + "turnover TEXT,lead_margin TEXT,excluded_revision INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(portfolio,event))");
+        db.execSQL("INSERT INTO old_trades SELECT " + columns + " FROM trades");
+        db.execSQL("DROP TABLE trades");
+        db.execSQL("ALTER TABLE old_trades RENAME TO trades");
+        db.execSQL("CREATE INDEX trades_time ON trades(portfolio,stamp DESC,event DESC)");
+        db.execSQL("CREATE UNIQUE INDEX trades_ordinal ON trades(portfolio,ordinal)");
+        if (indexed) db.execSQL("CREATE INDEX trades_detected ON trades(portfolio,detected_at DESC,stamp DESC)"
+                + " WHERE kind IN(0,-2) AND excluded_revision=0");
+    }
+
     private static void restoreV13ReviewSchema(SQLiteDatabase db) {
+        restoreTradeSchemaWithoutInclusion(db);
         db.execSQL("ALTER TABLE trade_reviews RENAME TO newer_trade_reviews");
         db.execSQL("CREATE TABLE trade_reviews (portfolio TEXT NOT NULL, stamp INTEGER NOT NULL, "
                 + "sample TEXT NOT NULL, checked TEXT, legacy INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(portfolio,stamp))");
@@ -1491,6 +1512,142 @@ public final class V3ArchiveTest {
         assertTrue(poll.result.join().historyComplete);
     }
 
+    @Test public void switchingToAnArchivedLeaderStopsAtTheFirstPageThatConnectsToItsTail() throws Exception {
+        String portfolio = "23324460";
+        WebsiteCapture capture = new WebsiteCapture(RuntimeEnvironment.getApplication(), portfolio, "");
+        LeaderArchive archive = LeaderArchive.open(RuntimeEnvironment.getApplication());
+        java.time.ZoneId zone = java.time.ZoneId.of("Asia/Shanghai");
+        java.time.LocalDate day = java.time.LocalDate.now(zone).minusDays(2);
+        String first = reviewLine(day, "12:01:00");
+        String middle = reviewLine(day, "12:02:00");
+        String tail = reviewLine(day, "12:03:00");
+        List<Rules.Signal> prior = WebRecords.parse(tail + middle + first, day, day, zone);
+        archive.capture(portfolio, "测试组合", prior, START, true, "原基线");
+        LeaderArchive.State saved = archive.state(portfolio);
+        WebsiteCapture.Poll poll = new WebsiteCapture.Poll(null, rows -> archive.connectsToTail(portfolio, saved, rows), false, true);
+        poll.tryArchiveJoin = true;
+        ReflectionHelpers.setField(capture, "current", poll);
+
+        String latest = reviewLine(day, "12:05:00") + reviewLine(day, "12:04:00");
+        JSONObject data = new JSONObject().put("phase", "rows").put("zone", zone.getId())
+                .put("dates", new JSONArray()).put("more", true).put("text", latest);
+        observe(capture, poll, data);
+        shadowOf(Looper.getMainLooper()).idleFor(900, TimeUnit.MILLISECONDS);
+        observe(capture, poll, data);
+        assertFalse(poll.result.isDone());
+
+        poll.pagination.clicked(android.os.SystemClock.elapsedRealtime());
+        observe(capture, poll, data.put("text", latest + tail + middle).put("loading", true));
+        shadowOf(Looper.getMainLooper()).idleFor(900, TimeUnit.MILLISECONDS);
+        observe(capture, poll, data);
+        assertFalse(poll.result.isDone());
+        observe(capture, poll, data.put("loading", false).put("moreReady", true));
+        WebsiteCapture.Read result = poll.result.getNow(null);
+        assertNotNull(poll.parseIssue, result);
+        assertTrue(result.joinedArchive);
+        assertTrue(result.historyComplete);
+        assertTrue(result.historyDetail.contains("2 页 · 已核对重合"));
+        assertFalse(poll.triedRange);
+        assertEquals(4, result.rows.size());
+
+        LeaderArchive.Update joined = archive.capture(portfolio, "", result.rows, START + 3000,
+                false, result.historyDetail, true, 1, true);
+        assertEquals(2, joined.added);
+        assertEquals(5, archive.count(portfolio));
+        assertEquals(new BigDecimal("5"), joined.state.estimate.get("MUUSDT|LONG"));
+        assertEquals(1, archive.verifiedSelection(portfolio));
+    }
+
+    @Test public void returnsFromArchivedOverlapWithoutReviewingAnOldPageEchoOrInvisiblePendingRows() throws Exception {
+        String portfolio = "23324461";
+        Application app = RuntimeEnvironment.getApplication();
+        LeaderArchive archive = LeaderArchive.open(app);
+        List<Rules.Signal> known = opens(0, 4);
+        LeaderArchive.State saved = archive.capture(portfolio, "", known, START, true, "旧档案").state;
+        Rules.Signal older = known.get(1), tail = known.get(3), pending = opens(5, 6).get(0);
+        archive.queueReviews(portfolio, Map.of(older.time, List.of(older, older.withOccurrence(1)),
+                pending.time, List.of(pending, pending.withOccurrence(1))));
+        List<Rules.Signal> homepage = List.of(older, older.withOccurrence(1), known.get(2), tail);
+        assertTrue(archive.connectsToTail(portfolio, saved, homepage));
+
+        var controller = Robolectric.buildService(AutoFollowService.class).create();
+        try {
+            AutoFollowService service = controller.get();
+            Rules.Config config = new Rules.Config(portfolio, new LocalData(app).config().rules);
+            ReflectionHelpers.setField(service, "initial", config);
+            WebsiteCapture.Read read = new WebsiteCapture.Read("", homepage, null, null, false, "", false, "", START);
+            WebsiteCapture.Read result = ReflectionHelpers.callInstanceMethod(service, "verifyWebsiteRows",
+                    ClassParameter.from(LeaderArchive.State.class, saved),
+                    ClassParameter.from(WebsiteCapture.Read.class, read), ClassParameter.from(boolean.class, true));
+            assertEquals(known.subList(1, 4).stream().map(row -> row.id).toList(),
+                    result.rows.stream().map(row -> row.id).toList());
+            LeaderArchive.Update joined = archive.capture(portfolio, "", result.rows, START + 5000,
+                    false, "首页接续", true, 1, true);
+            assertEquals(0, joined.added);
+            assertEquals(known.size(), archive.count(portfolio));
+            assertNotNull(archive.nextReview(portfolio));
+
+            long since = archive.reviewFromArchiveTail(portfolio, joined.state,
+                    List.of(tail, tail.withOccurrence(1)));
+            assertEquals(tail.time, since);
+            archive.queueReviews(portfolio, Map.of(tail.time, List.of(tail, tail.withOccurrence(1))));
+            assertEquals(tail.time, archive.nextReview(portfolio, since, tail.time, Set.of(tail.time)).stamp);
+        } finally { controller.destroy(); }
+    }
+
+    @Test public void resetsCachedInitialChoiceForANewTradingSessionButKeepsItForAnInterruptedSession() throws Exception {
+        String portfolio = "23324462";
+        Application app = RuntimeEnvironment.getApplication();
+        LocalData data = new LocalData(app);
+        LeaderArchive archive = LeaderArchive.open(app);
+        Rules.Config config = new Rules.Config(portfolio, Set.of("BTCUSDT"), false, BigDecimal.TEN, 5, BigDecimal.ONE);
+        LeaderArchive.State rejoined = archive.capture(portfolio, "", opens(0, 2), START, true, "已衔接旧档案").state;
+        FollowBook book = new FollowBook(config, "fixture");
+        String key = "initial_choice_" + AutoFollowService.DEMO_WEB + "_" + portfolio + "_fixture_selection_2";
+        data.prefs.edit().putBoolean(key, true).commit();
+        var controller = Robolectric.buildService(AutoFollowService.class).create();
+        try {
+            AutoFollowService service = controller.get();
+            ReflectionHelpers.setField(service, "mode", AutoFollowService.DEMO_WEB);
+            ReflectionHelpers.setField(service, "initial", config);
+            ReflectionHelpers.setField(service, "book", book);
+            restoreInitialChoice(service, false);
+            assertFalse(book.initialChoiceDone);
+            assertFalse(data.prefs.contains(key));
+            assertFalse(applyChoice(service, rejoined));
+            assertEquals(1, AutoFollowService.initialPositions().candidates.size());
+            assertTrue(book.waits().isEmpty());
+            book.initialChoiceDone = true;
+            restoreInitialChoice(service, true);
+            assertTrue(book.initialChoiceDone);
+        } finally { controller.destroy(); }
+    }
+
+    private static void restoreInitialChoice(AutoFollowService service, boolean resume) {
+        ReflectionHelpers.callInstanceMethod(service, "restoreInitialChoice",
+                ClassParameter.from(String.class, "fixture"), ClassParameter.from(long.class, 2L),
+                ClassParameter.from(boolean.class, resume));
+    }
+
+    @Test public void earlyArchiveJoinMustStillMatchTheConfirmedTailAtCommit() throws Exception {
+        String portfolio = "23324459";
+        LeaderArchive archive = LeaderArchive.open(RuntimeEnvironment.getApplication());
+        List<Rules.Signal> prior = opens(0, 3);
+        archive.capture(portfolio, "", prior, START, true, "已建档", false, 1);
+        List<Rules.Signal> missingTail = List.of(prior.get(0), opens(4, 5).get(0));
+        LeaderArchive.State saved = archive.state(portfolio);
+        assertTrue(archive.hasConfirmedOverlap(portfolio, missingTail));
+        assertFalse(archive.connectsToTail(portfolio, saved, missingTail));
+        try {
+            archive.capture(portfolio, "", missingTail, START + 1000, false, "衔接旧档案", true, 2, true);
+            fail("不可跳过已确认的最后一笔");
+        } catch (LeaderHistory.Gap expected) {
+            assertEquals(1, archive.verifiedSelection(portfolio));
+            assertEquals(saved.head, archive.state(portfolio).head);
+            assertEquals(3, archive.count(portfolio));
+        }
+    }
+
     @Test public void sevenDayBaselineKeepsEveryBoundaryFillAndStopsBeforeTheRestOfHistory() throws Exception {
         WebsiteCapture capture = new WebsiteCapture(RuntimeEnvironment.getApplication(), ID, "");
         WebsiteCapture.Poll poll = new WebsiteCapture.Poll(null, rows -> true, false, true);
@@ -1843,6 +2000,87 @@ public final class V3ArchiveTest {
         return partition;
     }
 
+    @Test public void upgradesVersionFourteenWithoutLosingConfirmedTradesOrReviewProof() throws Exception {
+        String portfolio = "8175418";
+        LeaderArchive archive = LeaderArchive.open(RuntimeEnvironment.getApplication());
+        List<Rules.Signal> trades = opens(0, 3);
+        archive.capture(portfolio, "", trades, START, true, "原基线");
+        archive.saveAccountFill(portfolio, AutoFollowService.DEMO_WEB, "kept-v14", START + 1, "原成交");
+        SQLiteDatabase old = archive.getWritableDatabase();
+        restoreTradeSchemaWithoutInclusion(old);
+        old.execSQL("ALTER TABLE trade_reviews RENAME TO newer_trade_reviews");
+        old.execSQL("CREATE TABLE trade_reviews (portfolio TEXT NOT NULL,stamp INTEGER NOT NULL,sample TEXT NOT NULL,"
+                + "checked TEXT,legacy INTEGER NOT NULL DEFAULT 0,baseline_checked INTEGER NOT NULL DEFAULT 0,"
+                + "PRIMARY KEY(portfolio,stamp))");
+        old.execSQL("INSERT INTO trade_reviews SELECT portfolio,stamp,sample,checked,legacy,baseline_checked FROM newer_trade_reviews");
+        old.execSQL("DROP TABLE newer_trade_reviews");
+        old.setVersion(14);
+        archive.close();
+        assertEquals(3L, archive.count(portfolio));
+        assertEquals(1L, archive.accountFillCount(portfolio));
+        assertTrue(archive.provisionalReviews(portfolio).isEmpty());
+        assertEquals(LeaderArchive.DB_VERSION, archive.getReadableDatabase().getVersion());
+    }
+
+    @Test public void provisionalPageCopySurvivesRestartAndCanBeRestoredWithoutNewSignals() throws Exception {
+        Application app = RuntimeEnvironment.getApplication();
+        LeaderArchive archive = LeaderArchive.open(app);
+        String portfolio = "8175416";
+        long time = 1795269872000L;
+        Rules.Signal first = new Rules.Signal("BTCUSDT", Rules.Action.OPEN_SHORT, time,
+                new BigDecimal("60000"), new BigDecimal("1"));
+        Rules.Signal older = new Rules.Signal("ETHUSDT", Rules.Action.OPEN_LONG, time - 1000,
+                new BigDecimal("3200"), new BigDecimal("2"));
+        Rules.Signal newer = new Rules.Signal("ETHUSDT", Rules.Action.OPEN_LONG, time + 1000,
+                new BigDecimal("3300"), new BigDecimal("1"));
+        Rules.Signal close = new Rules.Signal("BTCUSDT", Rules.Action.CLOSE_SHORT, time + 2000,
+                new BigDecimal("58000"), new BigDecimal("2"));
+        List<Rules.Signal> both = List.of(first, first.withOccurrence(1));
+        List<Rules.Signal> raw = List.of(older, first, first.withOccurrence(1), newer);
+        Map<String, Integer> limits = new java.util.LinkedHashMap<>();
+        TradeReview.recordPageRepeats(List.of(first, newer), raw, limits);
+        List<Rules.Signal> counted = TradeReview.limitCopies(both, limits);
+        assertEquals(1, counted.size());
+        assertEquals(2, TradeReview.limitCopies(both, Map.of()).size());
+
+        archive.capture(portfolio, "测试", raw, time + 3000, true, "基线", false, 0, false, Map.of(time, counted));
+        LeaderArchive.State initial = archive.state(portfolio);
+        assertTrue(initial.historyComplete);
+        assertEquals(3L, archive.count(portfolio));
+        assertEquals(4L, initial.head);
+        assertNull(archive.nextReview(portfolio));
+        assertEquals(Set.of("BTCUSDT|SHORT"), TradeReview.repeatedLegs(archive.provisionalReviews(portfolio).get(0).sample));
+        assertEquals(3, archive.normalizeProvisional(portfolio, raw, null).size());
+        assertFalse(archive.resolveProvisionalReview(portfolio, archive.provisionalReviews(portfolio).get(0), both, false));
+        assertEquals(new BigDecimal("1"), archive.state(portfolio).holdings.get("BTCUSDT|SHORT").quantity);
+        archive.capture(portfolio, "", List.of(older, first, newer, close), time + 4000);
+        assertEquals(1L, archive.detectionCount(portfolio));
+
+        ClosedTradeReview.Position position = new ClosedTradeReview.Position("BTCUSDT|SHORT", time,
+                time + 2000, new BigDecimal("2"), new BigDecimal("2"));
+        assertEquals(1, archive.confirmClosedPositionReviews(portfolio, List.of(), List.of(position)));
+        assertTrue(archive.provisionalReviews(portfolio).isEmpty());
+        assertEquals(5L, archive.count(portfolio));
+        assertEquals(5L, archive.state(portfolio).head);
+        assertEquals(1L, archive.detectionCount(portfolio));
+        assertTrue(archive.revision(portfolio) > 0);
+        assertEquals(new BigDecimal("1"), archive.visibleAt(portfolio, 4, 0, 0).get("BTCUSDT|SHORT"));
+        assertEquals(new BigDecimal("2"), archive.visibleAt(portfolio, 4, 0).get("BTCUSDT|SHORT"));
+        assertEquals(4, archive.normalizeProvisional(portfolio, List.of(older, first, newer), null).size());
+        assertEquals(0, archive.capture(portfolio, "", archive.normalizeProvisional(portfolio,
+                List.of(older, first, newer, close), null), time + 5000).added);
+
+        String unconfirmed = "8175417";
+        archive.capture(unconfirmed, "测试", raw, time + 3000, true, "基线", false, 0, false, Map.of(time, counted));
+        archive.close();
+        archive = LeaderArchive.open(app);
+        assertEquals(3L, archive.count(unconfirmed));
+        assertEquals(1, archive.provisionalReviews(unconfirmed).size());
+        assertTrue(archive.resolveProvisionalReview(unconfirmed, archive.provisionalReviews(unconfirmed).get(0), counted, false));
+        assertEquals(3L, archive.count(unconfirmed));
+        assertTrue(archive.provisionalReviews(unconfirmed).isEmpty());
+    }
+
     @Test public void missingDateControlsCanConfirmAnOlderSecondButCannotProveAnOverlappingCopy() throws Exception {
         WebsiteCapture capture = new WebsiteCapture(RuntimeEnvironment.getApplication(), ID, "");
         java.time.ZoneId zone = java.time.ZoneId.of("Asia/Shanghai");
@@ -2029,6 +2267,40 @@ public final class V3ArchiveTest {
         } finally {
             controller.destroy();
         }
+    }
+
+    @Test public void opensTheBinancePortfolioInsideTheAppEvenWithoutAMountedReader() throws Exception {
+        Application app = RuntimeEnvironment.getApplication();
+        ReflectionHelpers.setStaticField(WebsiteCapture.class, "mounted", null);
+        try (var controller = Robolectric.buildActivity(MainActivity.class).setup()) {
+            MainActivity activity = controller.get();
+            android.widget.Button button = ReflectionHelpers.getField(activity, "openWebsite");
+            assertTrue(button.isEnabled());
+            button.performClick();
+            AlertDialog dialog = ReflectionHelpers.getField(activity, "websitePrompt");
+            assertTrue(dialog.isShowing());
+            android.webkit.WebView preview = websiteView(dialog.getWindow().getDecorView());
+            assertNotNull(preview);
+            assertEquals(WebsiteCapture.portfolioUrl(new LocalData(app).config().portfolio), preview.getUrl());
+            assertNull(shadowOf(activity).getNextStartedActivity());
+            assertTrue(WebsiteCapture.previewAddress(android.net.Uri.parse("https://www.binance.com/zh-CN")));
+            assertFalse(WebsiteCapture.previewAddress(android.net.Uri.parse("intent://example.com")));
+            dialog.dismiss();
+            shadowOf(Looper.getMainLooper()).idle();
+            assertNull(preview.getParent());
+        }
+    }
+
+    private static android.webkit.WebView websiteView(View root) {
+        if (root instanceof android.webkit.WebView) return (android.webkit.WebView) root;
+        if (root instanceof ViewGroup) {
+            ViewGroup children = (ViewGroup) root;
+            for (int i = 0; i < children.getChildCount(); i++) {
+                android.webkit.WebView found = websiteView(children.getChildAt(i));
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     @Test public void manualBaselinePromptMovesTheSameWebViewAndOnlyForItsPortfolio() throws Exception {
@@ -2801,7 +3073,7 @@ public final class V3ArchiveTest {
                 ClassParameter.from(FollowBook.Entry.class, entry),
                 ClassParameter.from(String.class, AutoFollowService.DEMO_WEB),
                 ClassParameter.from(AutoFollowService.WaitingPrices.class, prices),
-                ClassParameter.from(BigDecimal.class, BigDecimal.ONE));
+                ClassParameter.from(BigDecimal.class, BigDecimal.ONE), ClassParameter.from(BigDecimal.class, null));
     }
 
     private static boolean applyChoice(AutoFollowService service, LeaderArchive.State state) {

@@ -13,10 +13,6 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 import org.json.JSONObject;
 
-/**
- * 用 Android Keystore 管理的密钥加密本机 API 凭证。环境标识作为 AES-GCM 附加认证数据，
- * 解密时必须匹配保存时的环境。
- */
 final class Secrets {
     private static final String ALIAS = "binance-copy-api-v1";
 

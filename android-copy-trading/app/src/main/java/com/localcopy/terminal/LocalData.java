@@ -21,7 +21,6 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/** 偏好设置和跟单状态的持久化入口。运行账本以 JSON 写入 Android 的 no-backup 私有目录。 */
 final class LocalData {
     static final String DEFAULT_PORTFOLIO = "5075281354358777856";
     static final BigDecimal DEFAULT_SLIPPAGE = new BigDecimal("0.3");
@@ -43,7 +42,6 @@ final class LocalData {
         }
     }
 
-    // 组合选择次数与配置一起提交。切回之前的组合也会产生新会话，服务据此重新核对基线。
     void saveConfig(Rules.Config config) throws JSONException {
         SharedPreferences.Editor update = prefs.edit().putString("config", configJson(config).toString());
         if (!config().portfolio.equals(config.portfolio)) {
@@ -125,7 +123,6 @@ final class LocalData {
         }
     }
 
-    // 待核对委托依赖此写入确认。用 AtomicFile 保留上次完整账本，并同步和回读本次写入后再返回。
     void save(String name, JSONObject data) throws IOException {
         synchronized (FILE_LOCK) {
             AtomicFile file = new AtomicFile(new File(directory, name + ".json"));

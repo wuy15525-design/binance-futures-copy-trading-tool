@@ -14,10 +14,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
-/**
- * 按合约并行准备调仓，避免一个慢查询挡住其他合约。这里仅查询和计算，
- * 调仓请求版本改变时丢弃旧结果，由持有交易锁的执行流程检查时效并发单。
- */
+/** Bounded concurrent exchange reads. Only the follow worker consumes results or submits orders. */
 final class CopyChecks implements AutoCloseable {
     private static final int LANES = 4;
 

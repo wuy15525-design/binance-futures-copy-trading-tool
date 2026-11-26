@@ -20,10 +20,6 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/**
- * 把官网已平仓记录作为独立证据，用开平时间、最大持仓量和已平仓量核对同一轮成交。
- * 仅在仓位周期和笔数能够确定时为历史档案提供重复纠正结果。
- */
 final class ClosedTradeReview {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss");
     private static final Pattern STAMP = Pattern.compile("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}");
@@ -126,17 +122,37 @@ final class ClosedTradeReview {
     }
 
     static Map<Long, List<Rules.Signal>> corrections(List<Rules.Signal> rows, List<Position> positions) {
+        return closedCounts(rows, positions, false);
+    }
+
+    static Map<Long, List<Rules.Signal>> confirmedCounts(List<Rules.Signal> rows, List<Position> positions) {
+        return closedCounts(rows, positions, true);
+    }
+
+    private static Map<Long, List<Rules.Signal>> closedCounts(List<Rules.Signal> rows, List<Position> positions,
+            boolean confirmUnchanged) {
         Set<String> excluded = new LinkedHashSet<>();
+        Set<String> proved = new LinkedHashSet<>();
         for (Position position : positions) {
             boolean overlaps = positions.stream().anyMatch(other -> !position.equals(other) && position.leg.equals(other.leg)
                     && other.openedAt <= position.closedAt && other.closedAt >= position.openedAt);
             if (overlaps) continue;
             List<Rules.Signal> cycle = new ArrayList<>();
             for (Rules.Signal row : rows) if (position.covers(row)) cycle.add(row);
-            excluded.addAll(excess(cycle, position));
+            Set<String> remove = excess(cycle, position);
+            if (remove == null) continue;
+            excluded.addAll(remove);
+            for (Rules.Signal row : cycle) proved.add(row.fingerprint);
         }
         Map<Long, List<Rules.Signal>> corrected = new LinkedHashMap<>();
-        for (Rules.Signal row : rows) if (excluded.contains(row.id)) corrected.put(row.time, new ArrayList<>());
+        for (Map.Entry<Long, List<Rules.Signal>> group : TradeReview.repeatedSeconds(rows).entrySet()) {
+            Set<String> seen = new LinkedHashSet<>(), repeated = new LinkedHashSet<>();
+            for (Rules.Signal row : group.getValue()) if (!seen.add(row.fingerprint)) repeated.add(row.fingerprint);
+            if (proved.containsAll(repeated) && (confirmUnchanged
+                    || group.getValue().stream().anyMatch(row -> excluded.contains(row.id)))) {
+                corrected.put(group.getKey(), new ArrayList<>());
+            }
+        }
         for (Rules.Signal row : rows) {
             List<Rules.Signal> kept = corrected.get(row.time);
             if (kept != null && !excluded.contains(row.id)) kept.add(row);
@@ -156,11 +172,11 @@ final class ClosedTradeReview {
     }
 
     private static Set<String> excess(List<Rules.Signal> cycle, Position position) {
-        if (cycle.size() < 3) return Collections.emptySet();
+        if (cycle.size() < 3) return null;
         Rules.Signal first = cycle.get(0);
         Rules.Signal last = cycle.get(cycle.size() - 1);
         if (!first.action.opens || first.time != position.openedAt || last.action.opens || last.time != position.closedAt) {
-            return Collections.emptySet();
+            return null;
         }
         BigDecimal open = Rules.ZERO, close = Rules.ZERO;
         List<Run> repeats = new ArrayList<>();
@@ -178,11 +194,10 @@ final class ClosedTradeReview {
         }
         BigDecimal excessOpen = open.subtract(position.volume);
         BigDecimal excessClose = close.subtract(position.volume);
-        if (repeats.isEmpty() || repeats.size() > 20 || excessOpen.signum() < 0 || excessClose.signum() < 0
-                || excessOpen.signum() + excessClose.signum() == 0) return Collections.emptySet();
+        if (repeats.isEmpty() || repeats.size() > 20 || excessOpen.signum() < 0 || excessClose.signum() < 0) return null;
         Search search = new Search(cycle, position.peak, repeats);
         search.find(0, excessOpen, excessClose);
-        if (search.attempts > SEARCH_LIMIT || search.solutions != 1) return Collections.emptySet();
+        if (search.attempts > SEARCH_LIMIT || search.solutions != 1) return null;
         return search.excluded;
     }
 

@@ -29,10 +29,6 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
-/**
- * 币安 U 本位 REST 客户端，负责合约规则、行情、账户查询与订单请求。
- * 连接环境决定凭证用途和可访问接口，响应通过统一的错误类型交给调用方退避或对账。
- */
 final class FuturesApi implements FollowExecutor.Exchange {
     static final String DEMO = "demo";
     static final String LIVE_READ = "readonly";
@@ -89,7 +85,7 @@ final class FuturesApi implements FollowExecutor.Exchange {
             switch (code) {
                 case -1100: case -1102: case -1111: case -1121: case -1122: case -1021:
                 case -1022: case -2015: case -2019: case -2022: case -1013:
-                case -2027: case -2028: case -4004: case -4028: case -4161: case -4164: case -5022:
+                case -2027: case -2028: case -4004: case -4028: case -4161: case -4164: case -5021: case -5022:
                 case -4202: case -4203: case -4205: case -4206: case -4208: case -4209:
                     return true;
                 default:
@@ -187,6 +183,14 @@ final class FuturesApi implements FollowExecutor.Exchange {
         PositionRisk longRisk, shortRisk;
         long longUpdated, shortUpdated;
         BigDecimal size(Rules.Action action) { return action.isLong ? longs : shorts; }
+        BigDecimal entryPrice(Rules.Action action) { return action.isLong ? longEntry : shortEntry; }
+        boolean sameOpeningBasis(Position other, Rules.Action action) {
+            if (longs.compareTo(other.longs) != 0 || shorts.compareTo(other.shorts) != 0) return false;
+            if (!action.opens || size(action).signum() == 0) return true;
+            BigDecimal a = entryPrice(action);
+            BigDecimal b = other.entryPrice(action);
+            return a == null ? b == null : b != null && a.compareTo(b) == 0;
+        }
         boolean flat() { return longs.signum() == 0 && shorts.signum() == 0; }
         BigDecimal exposure(BigDecimal price) { return longs.add(shorts).multiply(price).max(reportedNotional); }
     }
@@ -676,9 +680,8 @@ final class FuturesApi implements FollowExecutor.Exchange {
         if (table != null) table.observedMax = Math.min(table.observedMax, cap);
     }
 
-    // 双向模式显式指定持仓方向。单向模式的平仓单加只减仓标志，避免成交后反向开仓。
     @Override public void submit(String symbol, Rules.Action action, boolean hedge, BigDecimal quantity,
-            BigDecimal limit, String id) throws Exception {
+            BigDecimal limit, String id, boolean fullFill) throws Exception {
         if (action.sideOnly()) throw new IllegalArgumentException("官网成交开平方向待核对");
         String params = symbolParam(symbol) + "&side=" + action.exchangeSide()
                 + "&type=" + (limit == null ? "MARKET" : "LIMIT")
@@ -686,7 +689,7 @@ final class FuturesApi implements FollowExecutor.Exchange {
                 + "&newOrderRespType=ACK";
         if (hedge) params += "&positionSide=" + action.positionSide();
         else if (!action.opens) params += "&reduceOnly=true";
-        if (limit != null) params += "&timeInForce=IOC&price=" + Rules.show(limit);
+        if (limit != null) params += "&timeInForce=" + (fullFill ? "FOK" : "IOC") + "&price=" + Rules.show(limit);
         try { signed("POST", "/fapi/v1/order", params); }
         catch (Failure failure) {
             if (action.opens && (failure.code == -2027 || failure.code == -4028)) leverageTables.remove(symbol);
@@ -777,7 +780,6 @@ final class FuturesApi implements FollowExecutor.Exchange {
         return System.currentTimeMillis() + timeOffset;
     }
 
-    // 签名和校时在发送前完成。这个阶段出错可明确标记请求未发出，执行器据此清理待核对项。
     private Object signed(String method, String path, String query) throws Exception {
         String signed;
         try {
@@ -847,7 +849,6 @@ final class FuturesApi implements FollowExecutor.Exchange {
         return permitted(demo ? DEMO : LIVE_READ, verb, path, authenticated);
     }
 
-    // 在发请求前按环境、方法、路径和签名状态校验。只有交易环境可以发下单和杠杆设置请求。
     static boolean permitted(String realm, String verb, String path, boolean authenticated) {
         boolean trading = DEMO.equals(realm) || LIVE.equals(realm);
         if (!trading && !LIVE_READ.equals(realm)) return false;
