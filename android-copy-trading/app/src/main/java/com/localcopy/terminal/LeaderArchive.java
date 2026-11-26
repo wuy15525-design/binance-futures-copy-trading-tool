@@ -836,6 +836,144 @@ final class LeaderArchive extends SQLiteOpenHelper {
         }
     }
 
+    List<Rules.Signal> reconcileArchiveCloses(String portfolio, State state, List<Rules.Signal> rows,
+            long since, BigDecimal margin, boolean completeSwitch) throws JSONException {
+        if (state.latest() == null || rows.isEmpty()) return rows;
+        long tail = state.latest().time;
+        boolean disjoint = completeSwitch && rows.get(0).time > tail;
+        if (!disjoint && (!state.historyComplete || TradeReview.at(rows, tail).isEmpty())) return rows;
+        long reviewStart = Math.max(since, tail);
+        Map<Long, List<Rules.Signal>> samples = TradeReview.repeatedSeconds(rows);
+        samples.keySet().removeIf(stamp -> stamp < reviewStart);
+
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            Map<Long, List<Rules.Signal>> pendingSamples = pendingArchiveSamples(db, portfolio, rows, reviewStart);
+            samples.putAll(pendingSamples);
+            if (samples.isEmpty()) return rows;
+            long first = firstCurrentOrdinal(db, portfolio);
+            List<Rules.Signal> evidence = new ArrayList<>();
+            if (!disjoint) {
+                // The opening may predate the visible page. Use only the confirmed journal of this session.
+                try (Cursor trades = db.rawQuery("SELECT " + TRADE_COLUMNS + " FROM trades WHERE portfolio=? "
+                        + "AND ordinal BETWEEN ? AND ? AND stamp<? AND excluded_revision=0 ORDER BY stamp,ordinal",
+                        new String[]{portfolio, Long.toString(first), Long.toString(state.head), Long.toString(tail)})) {
+                    while (trades.moveToNext()) evidence.add(record(trades).signal);
+                }
+            }
+            for (Rules.Signal row : TradeReview.replace(rows, pendingSamples, margin)) {
+                if (row.time >= tail) evidence.add(row);
+            }
+            Map<Long, List<Rules.Signal>> settled = TradeReview.archiveCloseCounts(evidence, reviewStart);
+            if (settled.isEmpty()) return rows;
+
+            Set<String> unverifiedLegs = new HashSet<>();
+            if (!disjoint) {
+                for (Review review : provisionalReviews(portfolio)) {
+                    unverifiedLegs.addAll(TradeReview.repeatedLegs(review.sample));
+                }
+                Map<String, LeaderHistory.Holding> replayed = replay(db, portfolio, state.head);
+                state.holdings.forEach((leg, holding) -> {
+                    if (holding.inferredQuantity != null
+                            || visibleSize(replayed, leg).compareTo(holding.quantity) != 0) unverifiedLegs.add(leg);
+                });
+                replayed.keySet().stream().filter(leg -> !state.holdings.containsKey(leg)).forEach(unverifiedLegs::add);
+            }
+            for (Map.Entry<Long, List<Rules.Signal>> group : settled.entrySet()) {
+                long stamp = group.getKey();
+                List<Rules.Signal> sample = samples.get(stamp);
+                List<Rules.Signal> kept = TradeReview.limitCopies(TradeReview.at(rows, stamp),
+                        TradeReview.counts(group.getValue()));
+                if (!canConfirmArchiveClose(db, portfolio, stamp, sample, kept)) {
+                    unverifiedLegs.addAll(TradeReview.repeatedLegs(sample));
+                }
+                // Keep the current page's records and metadata when the extra copies came from a saved review.
+                group.setValue(kept);
+            }
+            settled.keySet().removeIf(stamp -> !Collections.disjoint(unverifiedLegs,
+                    TradeReview.repeatedLegs(samples.get(stamp))));
+            if (settled.isEmpty()) return rows;
+            List<Rules.Signal> verified = TradeReview.replace(rows, settled, margin);
+            if (!disjoint) {
+                List<Rules.Signal> known = confirmedAt(db, portfolio, tail, first);
+                if (known.isEmpty()) return rows;
+                LeaderHistory.Merge merge = LeaderHistory.merge(captureReference(db, portfolio, state), verified,
+                        true, !state.orderedSnapshot);
+                List<Rules.Signal> overlap = merge.rows.subList(0, merge.rows.size() - merge.added.size());
+                // Quantity proof cannot stand in for an archived trade or bridge a missing page.
+                LeaderHistory.pageGrowth(known, TradeReview.at(overlap, tail));
+            }
+            for (Map.Entry<Long, List<Rules.Signal>> group : settled.entrySet()) {
+                long stamp = group.getKey();
+                excludeUnconfirmedRepeats(db, portfolio, stamp, group.getValue());
+                saveCheckedReview(db, portfolio, stamp, samples.get(stamp), group.getValue());
+            }
+            db.setTransactionSuccessful();
+            return verified;
+        } catch (LeaderHistory.Gap missing) {
+            return rows;
+        } finally {
+            db.endTransaction();
+        }
+    }
+
+    private static boolean canConfirmArchiveClose(SQLiteDatabase db, String portfolio, long stamp,
+            List<Rules.Signal> sample, List<Rules.Signal> kept) throws JSONException {
+        try (Cursor saved = db.rawQuery("SELECT sample,checked,legacy,provisional FROM trade_reviews "
+                + "WHERE portfolio=? AND stamp=?", new String[]{portfolio, Long.toString(stamp)})) {
+            if (!saved.moveToFirst()) return true;
+            if (saved.getInt(2) != 0 || saved.getInt(3) != 0) return false;
+            List<Rules.Signal> previous = readReviewRows(saved.getString(0));
+            return saved.isNull(1)
+                    ? TradeReview.compatible(previous, sample) || TradeReview.hasAdditionalDetails(previous, sample)
+                    : TradeReview.compatible(previous, sample) && TradeReview.same(readReviewRows(saved.getString(1)), kept);
+        }
+    }
+
+    List<Rules.Signal> retainPendingArchiveSamples(String portfolio, State state, List<Rules.Signal> rows,
+            BigDecimal margin) throws JSONException {
+        Map<Long, List<Rules.Signal>> samples = pendingArchiveSamples(getReadableDatabase(), portfolio, rows,
+                state.latest().time + 1);
+        samples.values().removeIf(sample -> !TradeReview.exactCopies(sample));
+        return TradeReview.replace(rows, samples, margin);
+    }
+
+    private static Map<Long, List<Rules.Signal>> pendingArchiveSamples(SQLiteDatabase db, String portfolio,
+            List<Rules.Signal> rows, long since) throws JSONException {
+        Map<Long, List<Rules.Signal>> samples = new LinkedHashMap<>();
+        try (Cursor pending = db.rawQuery("SELECT stamp,sample FROM trade_reviews WHERE portfolio=? "
+                + "AND checked IS NULL AND provisional=0 AND legacy=0 AND stamp BETWEEN ? AND ?",
+                new String[]{portfolio, Long.toString(since), Long.toString(rows.get(rows.size() - 1).time)})) {
+            while (pending.moveToNext()) {
+                long stamp = pending.getLong(0);
+                List<Rules.Signal> sample = readReviewRows(pending.getString(1));
+                List<Rules.Signal> visible = TradeReview.at(rows, stamp);
+                if (sample.size() > visible.size() && TradeReview.compatible(sample, visible)) samples.put(stamp, sample);
+            }
+        }
+        return samples;
+    }
+
+    Map<Long, List<Rules.Signal>> stageableArchiveReviews(String portfolio, State state, List<Rules.Signal> rows,
+            boolean completeSwitch) throws JSONException {
+        Map<Long, List<Rules.Signal>> pending = new LinkedHashMap<>();
+        long tail = state.latest().time;
+        boolean disjoint = completeSwitch && rows.get(0).time > tail;
+        if (!disjoint && !connectsToTail(portfolio, state, rows)) return pending;
+        SQLiteDatabase db = getReadableDatabase();
+        for (Map.Entry<Long, List<Rules.Signal>> group : TradeReview.repeatedSeconds(rows).entrySet()) {
+            long stamp = group.getKey();
+            List<Rules.Signal> sample = group.getValue();
+            if (stamp <= tail || !TradeReview.exactCopies(sample)) continue;
+            // Defer only untouched seconds. Confirmed trades and existing independent proofs keep their identities.
+            List<Rules.Signal> kept = TradeReview.distinctExactCopies(sample);
+            if (confirmedAt(db, portfolio, stamp).isEmpty() && !hasCheckedReview(portfolio, stamp, sample)
+                    && canConfirmArchiveClose(db, portfolio, stamp, sample, kept)) pending.put(stamp, kept);
+        }
+        return pending;
+    }
+
     int confirmClosedPositionReviews(String portfolio, List<Rules.Signal> rows,
             List<ClosedTradeReview.Position> positions) throws JSONException {
         if (positions.isEmpty()) return 0;
@@ -1192,7 +1330,8 @@ final class LeaderArchive extends SQLiteOpenHelper {
             }
             if (rows.isEmpty()) {
                 if (switched || (returningFromEmpty && !trustedEmpty)) {
-                    Update update = startSegment(db, portfolio, title, rows, now, before, pagingDetail, selection, true);
+                    Update update = startSegment(db, portfolio, title, rows, now, before, pagingDetail,
+                            selection, true, Collections.emptyMap());
                     db.setTransactionSuccessful();
                     return update;
                 }
@@ -1221,7 +1360,8 @@ final class LeaderArchive extends SQLiteOpenHelper {
                     if (!newSegment.isEmpty()) {
                         boolean asBaseline = switched || !trustedEmpty || newSegment.size() != rows.size();
                         if (asBaseline && !historyEnded) throw gap;
-                        Update update = startSegment(db, portfolio, title, newSegment, now, before, pagingDetail, selection, asBaseline);
+                        Update update = startSegment(db, portfolio, title, newSegment, now, before, pagingDetail,
+                                selection, asBaseline, provisional);
                         db.setTransactionSuccessful();
                         return update;
                     }
@@ -1277,28 +1417,15 @@ final class LeaderArchive extends SQLiteOpenHelper {
                 }
             }
             long head = before.head;
-            Set<String> deferred = new HashSet<>();
-            if (baseline && historyEnded) {
-                for (Map.Entry<Long, List<Rules.Signal>> group : provisional.entrySet()) {
-                    List<Rules.Signal> raw = TradeReview.at(rows, group.getKey());
-                    if (raw.isEmpty()) continue;
-                    Set<String> accepted = group.getValue().stream().map(row -> row.id).collect(Collectors.toSet());
-                    for (Rules.Signal row : raw) if (!accepted.contains(row.id)) deferred.add(row.id);
-                    ContentValues values = new ContentValues();
-                    values.put("portfolio", portfolio);
-                    values.put("stamp", group.getKey());
-                    values.put("sample", LocalData.signalJson(raw).toString());
-                    values.put("provisional", 1);
-                    db.insertWithOnConflict("trade_reviews", null, values, SQLiteDatabase.CONFLICT_REPLACE);
-                }
-            }
+            Set<String> deferred = (baseline && historyEnded || switched && (historyEnded || joinedArchive))
+                    ? saveProvisionalReviews(db, portfolio, baseline ? rows : added, provisional) : Collections.emptySet();
             for (Rules.Signal row : added) {
-                Rules.Signal archived = putTrade(db, portfolio, row, ++head, baseline ? 1 : 0, now);
+                boolean hidden = deferred.contains(row.id);
+                int kind = baseline ? 1 : hidden ? RECONNECTED_BASELINE : 0;
+                Rules.Signal archived = putTrade(db, portfolio, row, ++head, kind, now);
                 if (archived != row) Collections.replaceAll(rows, row, archived);
-                if (deferred.remove(row.id)) {
-                    ContentValues hidden = new ContentValues();
-                    hidden.put("excluded_revision", -1);
-                    db.update("trades", hidden, "portfolio=? AND event=?", new String[]{portfolio, archived.id});
+                if (hidden) {
+                    hideProvisionalCopy(db, portfolio, archived.id);
                     rows.remove(archived);
                 } else LeaderHistory.apply(holdings, archived);
             }
@@ -1320,7 +1447,8 @@ final class LeaderArchive extends SQLiteOpenHelper {
                     rows, holdings, backfilled, historyComplete, historyDetail, recoveryHead, true);
             write(db, portfolio, current);
             db.setTransactionSuccessful();
-            return new Update(current, baseline ? 0 : added.size(), baseline || switched || returningFromEmpty, !unresolved);
+            return new Update(current, baseline ? 0 : added.size() - deferred.size(),
+                    baseline || switched || returningFromEmpty, !unresolved);
         } finally { db.endTransaction(); }
     }
 
@@ -1336,14 +1464,19 @@ final class LeaderArchive extends SQLiteOpenHelper {
     }
 
     private static Update startSegment(SQLiteDatabase db, String portfolio, String title, List<Rules.Signal> rows,
-            long now, State before, String detail, long selection, boolean baseline) throws JSONException {
+            long now, State before, String detail, long selection, boolean baseline,
+            Map<Long, List<Rules.Signal>> provisional) throws JSONException {
         long head = before.head;
         Map<String, LeaderHistory.Holding> holdings = new LinkedHashMap<>();
         List<Rules.Signal> archived = new ArrayList<>();
+        Set<String> deferred = baseline ? saveProvisionalReviews(db, portfolio, rows, provisional) : Collections.emptySet();
         for (Rules.Signal row : rows) {
             Rules.Signal saved = putTrade(db, portfolio, row, ++head, baseline ? RECONNECTED_BASELINE : 0, now);
-            archived.add(saved);
-            LeaderHistory.apply(holdings, saved);
+            if (deferred.contains(row.id)) hideProvisionalCopy(db, portfolio, saved.id);
+            else {
+                archived.add(saved);
+                LeaderHistory.apply(holdings, saved);
+            }
         }
         State current = new State(title, before.started > 0 ? before.started : now, now, head, false,
                 archived, holdings, before.backfilled, true,
@@ -1351,7 +1484,32 @@ final class LeaderArchive extends SQLiteOpenHelper {
                 baseline ? head : before.recoveryHead, true);
         write(db, portfolio, current);
         finalizeSelection(db, portfolio, selection, before.head + 1, rows.isEmpty());
-        return new Update(current, rows.size(), baseline, true);
+        return new Update(current, archived.size(), baseline, true);
+    }
+
+    private static Set<String> saveProvisionalReviews(SQLiteDatabase db, String portfolio, List<Rules.Signal> added,
+            Map<Long, List<Rules.Signal>> provisional) throws JSONException {
+        Set<String> deferred = new HashSet<>();
+        for (Map.Entry<Long, List<Rules.Signal>> group : provisional.entrySet()) {
+            List<Rules.Signal> raw = TradeReview.at(added, group.getKey());
+            if (raw.isEmpty()) continue;
+            Set<String> kept = TradeReview.limitCopies(raw, TradeReview.counts(group.getValue())).stream()
+                    .map(row -> row.id).collect(Collectors.toSet());
+            for (Rules.Signal row : raw) if (!kept.contains(row.id)) deferred.add(row.id);
+            ContentValues values = new ContentValues();
+            values.put("portfolio", portfolio);
+            values.put("stamp", group.getKey());
+            values.put("sample", LocalData.signalJson(raw).toString());
+            values.put("provisional", 1);
+            db.insertWithOnConflict("trade_reviews", null, values, SQLiteDatabase.CONFLICT_REPLACE);
+        }
+        return deferred;
+    }
+
+    private static void hideProvisionalCopy(SQLiteDatabase db, String portfolio, String event) {
+        ContentValues values = new ContentValues();
+        values.put("excluded_revision", -1);
+        db.update("trades", values, "portfolio=? AND event=?", new String[]{portfolio, event});
     }
 
     private static void finalizeSelection(SQLiteDatabase db, String portfolio, long selection, long segmentStart, boolean trustedEmpty) {

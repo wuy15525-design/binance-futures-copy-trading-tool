@@ -172,6 +172,149 @@ final class TradeReview {
         return new BaselineCounts(kept, settled);
     }
 
+    static Map<Long, List<Rules.Signal>> archiveCloseCounts(List<Rules.Signal> rows, long since) {
+        return closeCounts(rows, since, false, Long.MIN_VALUE);
+    }
+
+    static boolean canReviewFromList(List<Rules.Signal> sample) {
+        if (!exactCopies(sample)) return false;
+        Set<String> seen = new HashSet<>();
+        return sample.stream().allMatch(row -> seen.add(key(row)) || knownAction(row));
+    }
+
+    static List<Rules.Signal> checkOpeningCopies(List<Rules.Signal> sample) {
+        if (!canReviewFromList(sample)) return Collections.emptyList();
+        List<Rules.Signal> kept = distinctOpeningCopies(sample);
+        return anyDuplicateKey(kept) ? Collections.emptyList() : kept;
+    }
+
+    static List<Rules.Signal> checkCloseCopies(List<Rules.Signal> rows, long stamp,
+            List<Rules.Signal> sample, boolean ended) {
+        // The list must have advanced past the entire second before it can supply evidence.
+        if (rows.isEmpty() || rows.get(0).time >= stamp) return Collections.emptyList();
+        List<Rules.Signal> visible = at(rows, stamp);
+        if (!compatible(sample, visible)) return Collections.emptyList();
+        if (sample.size() > visible.size()) rows = replace(rows, Collections.singletonMap(stamp, sample), null);
+        long oldest = ended ? Long.MIN_VALUE : rows.get(0).time;
+        return closeCounts(distinctOpeningCopies(rows), Long.MIN_VALUE, true, oldest)
+                .getOrDefault(stamp, Collections.emptyList());
+    }
+
+    private static List<Rules.Signal> distinctOpeningCopies(List<Rules.Signal> rows) {
+        Set<String> seen = new HashSet<>();
+        List<Rules.Signal> kept = new ArrayList<>(rows.size());
+        for (Rules.Signal row : rows) {
+            if (!knownAction(row) || !row.action.opens || seen.add(key(row))) kept.add(row);
+        }
+        return kept;
+    }
+
+    private static Map<Long, List<Rules.Signal>> closeCounts(List<Rules.Signal> rows, long since,
+            boolean fromList, long oldestOpenMayBeClipped) {
+        Map<Long, List<Rules.Signal>> seconds = repeatedSeconds(rows);
+        seconds.keySet().removeIf(stamp -> stamp < since);
+        Set<String> uncertain = new HashSet<>();
+        Map<String, Integer> candidates = new LinkedHashMap<>();
+        Map<String, List<Rules.Signal>> histories = new LinkedHashMap<>();
+        for (List<Rules.Signal> second : seconds.values()) {
+            Set<String> fingerprints = new HashSet<>(), repeats = new HashSet<>();
+            for (Rules.Signal row : second) if (!fingerprints.add(row.fingerprint)) repeats.add(row.fingerprint);
+            uncertain.addAll(repeats);
+            String leg = null;
+            boolean eligible = !hasDifferentDetails(second);
+            for (Rules.Signal row : second) {
+                if (!repeats.contains(row.fingerprint)) continue;
+                if (!knownAction(row) || row.action.opens || (leg != null && !leg.equals(row.leg()))) eligible = false;
+                leg = row.leg();
+            }
+            if (eligible && leg != null) {
+                for (Rules.Signal row : second) {
+                    if (repeats.contains(row.fingerprint)) candidates.merge(row.fingerprint, 1, Integer::sum);
+                }
+                histories.computeIfAbsent(leg, ignored -> new ArrayList<>());
+            }
+        }
+        for (Rules.Signal row : rows) {
+            if (knownAction(row)) {
+                List<Rules.Signal> history = histories.get(row.leg());
+                if (history != null) history.add(row);
+            } else {
+                for (String side : new String[]{"|LONG", "|SHORT"}) {
+                    List<Rules.Signal> history = histories.get(row.symbol + side);
+                    if (history != null) history.add(row);
+                }
+            }
+        }
+        Map<Long, List<Rules.Signal>> settled = new LinkedHashMap<>();
+        for (List<Rules.Signal> history : histories.values()) {
+            BigDecimal size = Rules.ZERO;
+            for (int i = 0; i < history.size();) {
+                Rules.Signal first = history.get(i);
+                if (!knownAction(first)) break;
+                if (first.action.opens) {
+                    if (uncertain.contains(first.fingerprint) || first.time == oldestOpenMayBeClipped) break;
+                    size = size.add(first.quantity);
+                    i++;
+                    continue;
+                }
+                BigDecimal volume = Rules.ZERO;
+                BigDecimal smallestCopy = null;
+                Map<String, Integer> counted = new LinkedHashMap<>();
+                Set<Long> verifiedSeconds = new LinkedHashSet<>();
+                boolean unresolved = false;
+                for (; i < history.size(); i++) {
+                    Rules.Signal close = history.get(i);
+                    if (!knownAction(close) || close.action.opens) break;
+                    if (uncertain.contains(close.fingerprint)) {
+                        if (!candidates.containsKey(close.fingerprint)) unresolved = true;
+                        if (counted.merge(close.fingerprint, 1, Integer::sum) > 1) {
+                            if (smallestCopy == null || close.quantity.compareTo(smallestCopy) < 0) smallestCopy = close.quantity;
+                            continue;
+                        }
+                        verifiedSeconds.add(close.time);
+                    }
+                    volume = volume.add(close.quantity);
+                }
+                if (unresolved) break;
+                if (!verifiedSeconds.isEmpty()) {
+                    // Reserve one of every distinct close in this run. Every extra copy must exceed the remainder.
+                    BigDecimal remainder = size.subtract(volume);
+                    if (remainder.signum() < 0 || !candidates.entrySet().containsAll(counted.entrySet())) break;
+                    if (remainder.signum() > 0 && (!fromList || smallestCopy == null
+                            || remainder.compareTo(smallestCopy) >= 0)) break;
+                    boolean wholeSeconds = verifiedSeconds.stream().allMatch(stamp -> seconds.get(stamp).stream()
+                            .allMatch(row -> !uncertain.contains(row.fingerprint) || counted.containsKey(row.fingerprint)));
+                    if (!wholeSeconds) break;
+                    for (long stamp : verifiedSeconds) settled.put(stamp, distinctExactCopies(seconds.get(stamp)));
+                }
+                size = size.subtract(volume);
+                if (size.signum() < 0) {
+                    if (history.get(i - 1).time >= since) break;
+                    // An older confirmed close may predate the retained opening. Replay subsequent cycles as the archive does.
+                    size = Rules.ZERO;
+                }
+            }
+        }
+        return settled;
+    }
+
+    static List<Rules.Signal> distinctExactCopies(List<Rules.Signal> rows) {
+        Set<String> seen = new HashSet<>();
+        List<Rules.Signal> kept = new ArrayList<>(rows.size());
+        for (Rules.Signal row : rows) if (seen.add(key(row))) kept.add(row);
+        return kept;
+    }
+
+    static boolean exactCopies(List<Rules.Signal> second) {
+        return anyDuplicateKey(second) && !hasDifferentDetails(second);
+    }
+
+    private static boolean anyDuplicateKey(List<Rules.Signal> rows) {
+        Set<String> seen = new HashSet<>();
+        for (Rules.Signal row : rows) if (!seen.add(key(row))) return true;
+        return false;
+    }
+
     private static boolean hasDifferentDetails(List<Rules.Signal> rows) {
         Map<String, String> keys = new LinkedHashMap<>();
         for (Rules.Signal row : rows) {

@@ -266,6 +266,7 @@ final class WebsiteCapture {
         boolean rangeConfirmed, reopenedDatePage;
         boolean baselineEndObserved, allowEmptyPartition;
         boolean reviewPageOverlap, targetedReview;
+        List<Rules.Signal> quantityReviewSample = Collections.emptyList();
         final Map<String, Integer> pageRepeatLimits = new LinkedHashMap<>();
         boolean javascriptResponded, baselineScriptRestarted;
         Poll(Rules.Signal anchor, Predicate<List<Rules.Signal>> archiveOverlap, boolean profile, boolean baseline) {
@@ -283,6 +284,7 @@ final class WebsiteCapture {
         }
 
         boolean reviewing() { return reviewStamp > 0; }
+        boolean quantityReview() { return !quantityReviewSample.isEmpty(); }
         boolean unfilteredReview() { return !reviewFallback.isEmpty(); }
         boolean continuingBaseline() { return continuationFrom > 0; }
         boolean initialBaseline() { return baseline && anchor == null && !continuingBaseline(); }
@@ -326,7 +328,7 @@ final class WebsiteCapture {
             if (balances != null) return BALANCE_DEADLINE;
             if (profile) return DEADLINE;
             if (continuingBaseline()) return BASELINE_CONTINUATION_DEADLINE;
-            if (targetedReview) return 15000;
+            if (targetedReview && !quantityReview()) return 15000;
             return baseline ? BASELINE_DEADLINE : reviewing() ? REVIEW_DEADLINE : RECOVERY_DEADLINE;
         }
     }
@@ -749,14 +751,21 @@ final class WebsiteCapture {
         return new DateRange(first, last, poll.baselineZone);
     }
 
-    List<Rules.Signal> review(long stamp) throws Exception {
-        return TradeReview.at(waitFor(new Poll(null, rows -> false, false, false, stamp)).rows, stamp);
+    List<Rules.Signal> review(LeaderArchive.Review review) throws Exception {
+        return review(review, false);
     }
 
-    List<Rules.Signal> reviewProvisional(long stamp) throws Exception {
-        Poll poll = new Poll(null, rows -> false, false, false, stamp);
-        poll.targetedReview = true;
-        return TradeReview.at(waitFor(poll).rows, stamp);
+    List<Rules.Signal> reviewProvisional(LeaderArchive.Review review) throws Exception {
+        return review(review, true);
+    }
+
+    private List<Rules.Signal> review(LeaderArchive.Review review, boolean provisional) throws Exception {
+        List<Rules.Signal> openings = TradeReview.checkOpeningCopies(review.sample);
+        if (!openings.isEmpty()) return openings;
+        Poll poll = new Poll(null, rows -> false, false, false, review.stamp);
+        poll.targetedReview = provisional;
+        if (TradeReview.canReviewFromList(review.sample)) poll.quantityReviewSample = review.sample;
+        return TradeReview.at(waitFor(poll).rows, review.stamp);
     }
 
     List<ClosedTradeReview.Position> closedPositions() throws Exception {
@@ -831,7 +840,8 @@ final class WebsiteCapture {
                     poll.pagination.manualResume(poll.startedAt);
                     manualBaselineDocument = "";
                 }
-            } else if ((poll.positionHistory != null || (poll.continuingBaseline() && !poll.reopenedDatePage))
+            } else if ((poll.positionHistory != null || poll.quantityReview()
+                    || (poll.continuingBaseline() && !poll.reopenedDatePage))
                     && !document.isEmpty() && safe(page.getUrl())) {
                 poll.document = document;
             } else {
@@ -1132,7 +1142,8 @@ final class WebsiteCapture {
             again(poll);
             return;
         }
-        if (poll.reviewing() && !poll.triedRange && !poll.unfilteredReview() && listing && !busy && !loading) {
+        if (poll.reviewing() && !poll.quantityReview() && !poll.triedRange && !poll.unfilteredReview()
+                && listing && !busy && !loading) {
             if (poll.controlsSince == 0) poll.controlsSince = now;
             if (selectRange(poll, data, now) || now - poll.controlsSince < 3000) again(poll);
             else fallbackReview(poll, "官网日期控件未加载");
@@ -1209,6 +1220,7 @@ final class WebsiteCapture {
                 && (poll.continuingBaseline() || !poll.name.isEmpty()) && !data.optBoolean("more")) {
             if (poll.emptySince == 0) poll.emptySince = now;
             if (now - poll.emptySince >= (poll.continuingBaseline() ? BASELINE_EMPTY_WAIT : EMPTY_WAIT)) {
+                if (poll.quantityReview()) { complete(poll, true); return; }
                 if (poll.reviewing()) { fallbackReview(poll, "官网所选日期没有返回记录"); return; }
                 if (poll.continuingBaseline()) {
                     if (poll.allowEmptyPartition && poll.triedRange && displayed != null
@@ -1243,7 +1255,8 @@ final class WebsiteCapture {
             }
         } else if ("rows".equals(phase) && poll.selectingDate == null) {
             poll.emptySince = 0;
-            if (poll.reviewing() && ((!poll.triedRange && !poll.unfilteredReview()) || busy || loading)) {
+            if (poll.reviewing() && (busy || loading
+                    || (!poll.quantityReview() && !poll.triedRange && !poll.unfilteredReview()))) {
                 again(poll);
                 return;
             }
@@ -1273,7 +1286,8 @@ final class WebsiteCapture {
                         if (poll.baseline && older > 0 && poll.pagination.inFlight()) {
                             TradeReview.recordPageRepeats(poll.lastRows, rows, poll.pageRepeatLimits);
                         }
-                        if (poll.reviewing() && TradeReview.addsIdenticalTrade(poll.lastRows, rows, poll.reviewStamp)) {
+                        if (poll.reviewing() && !poll.quantityReview()
+                                && TradeReview.addsIdenticalTrade(poll.lastRows, rows, poll.reviewStamp)) {
                             poll.reviewPageOverlap = true;
                         }
                         long latest = poll.lastRows.get(poll.lastRows.size() - 1).time;
@@ -1299,7 +1313,8 @@ final class WebsiteCapture {
                 // Date inputs can render after the first trades and without any change to their text.
                 poll.displayedRange = displayed;
             }
-            if (poll.reviewing() && !poll.unfilteredReview() && !poll.parseIssue.isEmpty() && now - poll.calendarSince >= 5000) {
+            if (poll.reviewing() && !poll.quantityReview() && !poll.unfilteredReview()
+                    && !poll.parseIssue.isEmpty() && now - poll.calendarSince >= 5000) {
                 fallbackReview(poll, "日期切换后官网记录尚未稳定");
                 return;
             }
@@ -1319,7 +1334,9 @@ final class WebsiteCapture {
                 return;
             }
             if (poll.reviewing() && !busy && !loading && "rows".equals(phase) && poll.parseIssue.isEmpty()) {
-                if (poll.lastRows.get(0).time < poll.reviewStamp) {
+                if (poll.quantityReview()) {
+                    if (settled && checkQuantityReview(poll, false)) return;
+                } else if (poll.lastRows.get(0).time < poll.reviewStamp) {
                     if (!settled) { again(poll); return; }
                     if (TradeReview.at(poll.lastRows, poll.reviewStamp).isEmpty()) {
                         fallbackReview(poll, "官网已读页面没有包含待核对的成交");
@@ -1471,6 +1488,19 @@ final class WebsiteCapture {
     }
 
     private void complete(Poll poll, boolean ended) {
+        if (poll.quantityReview()) {
+            if (ended && checkQuantityReview(poll, true)) return;
+            if (poll.previous == null && !poll.pagination.inFlight()
+                    && TradeReview.at(poll.lastRows, poll.reviewStamp).isEmpty()
+                    && SystemClock.elapsedRealtime() - poll.startedAt < poll.deadline() - 10000) {
+                // An earlier read may have left this document on a restricted range.
+                restartRows(poll);
+                return;
+            }
+            fail(reviewFailure(ended ? "已展开成交列表，同方向开平仓数量仍不足以确认笔数"
+                    : "成交列表分页未完成，尚未确认平仓笔数"));
+            return;
+        }
         if (poll.reviewing() && !ended) {
             fallbackReview(poll, "官网分页复核未完成");
             return;
@@ -1490,6 +1520,20 @@ final class WebsiteCapture {
             fail(reviewFailure("所选日期未完整覆盖待核对的这一秒"));
             return;
         }
+        finishRead(poll, ended);
+    }
+
+    private boolean checkQuantityReview(Poll poll, boolean ended) {
+        List<Rules.Signal> checked = TradeReview.checkCloseCopies(poll.lastRows, poll.reviewStamp,
+                poll.quantityReviewSample, ended);
+        if (checked.isEmpty()) return false;
+        poll.lastRows = TradeReview.replace(poll.lastRows, Collections.singletonMap(poll.reviewStamp, checked),
+                poll.leaderMargin);
+        finishRead(poll, true);
+        return true;
+    }
+
+    private void finishRead(Poll poll, boolean ended) {
         current = null;
         boolean joinedArchive = ended && poll.matchesArchive;
         List<Rules.Signal> rows = new ArrayList<>(poll.lastRows.size());
@@ -1664,7 +1708,8 @@ final class WebsiteCapture {
             return;
         }
         if (poll.reviewing()) {
-            String attempt = poll.unfilteredReview() ? "逐页核对超时 · " + poll.reviewFallback
+            String attempt = poll.quantityReview() ? "展开成交列表超时，尚未确认平仓笔数"
+                    : poll.unfilteredReview() ? "逐页核对超时 · " + poll.reviewFallback
                     : poll.selectingDate != null ? "官网日历选择超时" : "未读到可确认的完整一秒";
             fail(reviewFailure(attempt));
             return;

@@ -57,6 +57,52 @@ public final class TerminalTests {
                     fullClose, fullClose.withOccurrence(1)), java.util.Set.of(fullClose.time));
             ok(upgrade.rows.size() == 4 && upgrade.settled.get(fullClose.time).size() == 2);
         });
+        test("衔接旧档时按已知开空和后续平空数量归并唯一多出的副本", () -> {
+            Rules.Signal open = new Rules.Signal(MU, OPEN_SHORT, now, d("100"), d("10.25"));
+            Rules.Signal close = new Rules.Signal(MU, CLOSE_SHORT, now + 1000, d("95"), d("3.25"),
+                    d("16.25"), d("308.75"), null);
+            Rules.Signal next = new Rules.Signal(MU, CLOSE_SHORT, now + 2000, d("94"), d("7"));
+            Rules.Signal otherSide = new Rules.Signal(MU, OPEN_LONG, close.time, d("95"), d("2"));
+            List<Rules.Signal> raw = List.of(open, close, otherSide, close.withOccurrence(1), next);
+            Map<Long, List<Rules.Signal>> verified = TradeReview.archiveCloseCounts(raw, close.time);
+            ok(verified.size() == 1 && verified.get(close.time).equals(List.of(close, otherSide)));
+            ok(TradeReview.replace(raw, verified, null).equals(List.of(open, close, otherSide, next)));
+        });
+        test("旧档本地复核保留可行的真实多笔、明细差异和缺少开仓依据的成交", () -> {
+            Rules.Signal open = new Rules.Signal(MU, OPEN_SHORT, now, d("100"), d("10"));
+            Rules.Signal close = new Rules.Signal(MU, CLOSE_SHORT, now + 1000, d("95"), d("3"), d("15"));
+            Rules.Signal repeated = close.withOccurrence(1);
+            Rules.Signal later = new Rules.Signal(MU, CLOSE_SHORT, now + 2000, d("94"), d("7"));
+            Rules.Signal smaller = new Rules.Signal(MU, CLOSE_SHORT, later.time, d("94"), d("4"));
+            Rules.Signal different = new Rules.Signal(MU, CLOSE_SHORT, close.time, d("95"), d("3"), d("16"))
+                    .withOccurrence(1);
+            Rules.Signal unknown = new Rules.Signal(MU, SELL, now, d("100"), d("10"));
+            Rules.Signal openingThree = new Rules.Signal(MU, OPEN_SHORT, now, d("100"), d("3"));
+            Rules.Signal reopened = new Rules.Signal(MU, OPEN_SHORT, close.time, d("99"), d("3"));
+            for (List<Rules.Signal> uncertain : List.of(List.of(open, close, repeated, smaller),
+                    List.of(open, close, different, later), List.of(close, repeated, later),
+                    List.of(unknown, close, repeated, later), List.of(open, close, repeated, close.withOccurrence(2), smaller),
+                    List.of(openingThree, close, reopened, repeated))) {
+                ok(TradeReview.archiveCloseCounts(uncertain, close.time).isEmpty());
+            }
+        });
+        test("更早历史不完整时仍可按已知仓位核对同一轮的多个分页副本", () -> {
+            Rules.Signal earlier = new Rules.Signal(MU, CLOSE_SHORT, now - 1000, d("98"), d("2"));
+            Rules.Signal open = new Rules.Signal(MU, OPEN_SHORT, now, d("100"), d("10"));
+            Rules.Signal first = new Rules.Signal(MU, CLOSE_SHORT, now + 1000, d("97"), d("3"));
+            Rules.Signal second = new Rules.Signal(MU, CLOSE_SHORT, now + 2000, d("96"), d("2"));
+            Rules.Signal finalClose = new Rules.Signal(MU, CLOSE_SHORT, now + 3000, d("95"), d("5"));
+            List<Rules.Signal> raw = List.of(earlier, open, first, first.withOccurrence(1),
+                    second, second.withOccurrence(1), finalClose);
+            Map<Long, List<Rules.Signal>> verified = TradeReview.archiveCloseCounts(raw, first.time);
+            ok(verified.size() == 2);
+            ok(TradeReview.replace(raw, verified, null).equals(List.of(earlier, open, first, second, finalClose)));
+
+            Rules.Signal ambiguous = new Rules.Signal(MU, CLOSE_SHORT, finalClose.time, d("95"), d("3"));
+            List<Rules.Signal> insufficient = new ArrayList<>(raw);
+            insufficient.set(insufficient.size() - 1, ambiguous);
+            ok(TradeReview.archiveCloseCounts(insufficient, first.time).isEmpty());
+        });
         test("中文合约代码可保存，官网成交及平仓历史保留原单位", () -> {
             String symbol = "币安人生USDT";
             String card = "11-18, 23:14:58\n开多\n以价格为0.1 USDT买入开多币安人生USDT永续合约，成交数量为2 币安人生总价值为0.2 USDT。";

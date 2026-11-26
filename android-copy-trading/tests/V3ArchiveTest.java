@@ -1595,6 +1595,221 @@ public final class V3ArchiveTest {
         } finally { controller.destroy(); }
     }
 
+    @Test public void switchingToAnOldArchiveSettlesAPaginatedShortCloseWithoutDateControls() throws Exception {
+        String portfolio = "23324463";
+        Application app = RuntimeEnvironment.getApplication();
+        LeaderArchive archive = LeaderArchive.open(app);
+        java.time.ZoneId zone = java.time.ZoneId.of("Asia/Shanghai");
+        java.time.LocalDate day = java.time.LocalDate.now(zone).minusDays(2);
+        String opening = day + " 20:00:00\n开空\n以均价为100USDT 卖出开空MUUSDT永续合约，成交数量为 6MU。\n";
+        String tail = day + " 20:05:00\n开空\n以均价为100USDT 卖出开空MUUSDT永续合约，成交数量为 4MU。\n";
+        String close = day + " 20:14:13\n平空\n以均价为95USDT 买入平空MUUSDT永续合约，成交数量为 3MU。\n";
+        String later = day + " 20:19:00\n平空\n以均价为94USDT 买入平空MUUSDT永续合约，成交数量为 7MU。\n";
+        List<Rules.Signal> prior = WebRecords.parse(tail + opening, day, day, zone);
+        LeaderArchive.State before = archive.capture(portfolio, "", prior, START, true, "原基线").state;
+        archive.saveAccountFill(portfolio, AutoFollowService.DEMO_WEB, "old-fill", START, "原有成交");
+        WebsiteCapture capture = new WebsiteCapture(app, portfolio, "");
+        WebsiteCapture.Poll poll = new WebsiteCapture.Poll(null, rows -> archive.connectsToTail(portfolio, before, rows),
+                false, true);
+        poll.tryArchiveJoin = true;
+        ReflectionHelpers.setField(capture, "current", poll);
+        JSONObject view = new JSONObject().put("phase", "rows").put("zone", zone.getId())
+                .put("dates", new JSONArray()).put("more", true).put("text", later + close);
+        observe(capture, poll, view);
+        assertFalse(poll.result.isDone());
+        poll.pagination.clicked(android.os.SystemClock.elapsedRealtime());
+        observe(capture, poll, view.put("text", later + close + close + tail));
+        shadowOf(Looper.getMainLooper()).idleFor(900, TimeUnit.MILLISECONDS);
+        observe(capture, poll, view);
+        WebsiteCapture.Read read = poll.result.getNow(null);
+        assertNotNull(read);
+        assertTrue(read.joinedArchive);
+        assertFalse(poll.triedRange);
+        assertEquals(1, read.pageRepeatLimits.size());
+        Rules.Signal repeated = read.rows.get(1);
+        List<Rules.Signal> rawGroup = TradeReview.at(read.rows, repeated.time);
+        assertEquals(2, rawGroup.size());
+        archive.queueReviews(portfolio, Map.of(repeated.time, rawGroup));
+
+        // Leaving the service without a scraper makes any attempt to reread the date range fail this regression.
+        var controller = Robolectric.buildService(AutoFollowService.class).create();
+        try {
+            AutoFollowService service = controller.get();
+            ReflectionHelpers.setField(service, "initial", new Rules.Config(portfolio, new LocalData(app).config().rules));
+            WebsiteCapture.Read verified = ReflectionHelpers.callInstanceMethod(service, "verifyWebsiteRows",
+                    ClassParameter.from(LeaderArchive.State.class, before),
+                    ClassParameter.from(WebsiteCapture.Read.class, read), ClassParameter.from(boolean.class, true));
+            assertEquals(1, TradeReview.at(verified.rows, repeated.time).size());
+            assertNull(archive.nextReview(portfolio));
+            assertEquals(2L, archive.count(portfolio));
+            LeaderArchive.Update saved = archive.capture(portfolio, "", verified.rows, START + 4000, false,
+                    read.historyDetail, true, 1, true);
+            assertTrue(saved.continuous);
+            assertEquals(2, saved.added);
+            assertEquals(1, archive.verifiedSelection(portfolio));
+            assertFalse(saved.state.estimate.containsKey("MUUSDT|SHORT"));
+        } finally { controller.destroy(); }
+
+        archive.close();
+        assertEquals(4L, archive.count(portfolio));
+        assertEquals(1L, archive.accountFillCount(portfolio));
+        List<Rules.Signal> afterRestart = archive.normalizeReviewedDuplicates(portfolio, read.rows, null);
+        assertEquals(1, TradeReview.at(afterRestart, repeated.time).size());
+        assertTrue(archive.connectsToTail(portfolio, archive.state(portfolio), afterRestart));
+    }
+
+    @Test public void exactCloseReviewFollowsTwoPagesToTheOpeningWithoutTouchingTheCalendar() throws Exception {
+        var zone = java.time.ZoneId.of("Asia/Shanghai");
+        var day = java.time.LocalDate.now(zone).minusDays(2);
+        String newest = reviewLine(day, "20:20:00");
+        String close = day + " 20:14:13\n平空\n以均价为95USDT 买入平空MUUSDT永续合约，成交数量为 7MU。\n";
+        String earlierClose = day + " 20:10:00\n平空\n以均价为96USDT 买入平空MUUSDT永续合约，成交数量为 2MU。\n";
+        String opening = day + " 20:00:00\n开空\n以均价为100USDT 卖出开空MUUSDT永续合约，成交数量为 10MU。\n";
+        String older = reviewLine(day, "19:59:00");
+        String pageOne = newest + close;
+        String pageTwo = pageOne + close + earlierClose;
+        String pageThree = pageTwo + opening + opening + older;
+        var sample = WebRecords.parse(close + close, day, day, zone);
+        long stamp = sample.get(0).time;
+        var capture = new WebsiteCapture(RuntimeEnvironment.getApplication(), "23324468", "");
+        var poll = new WebsiteCapture.Poll(null, rows -> false, false, false, stamp);
+        poll.quantityReviewSample = sample;
+        ReflectionHelpers.setField(capture, "current", poll);
+        var view = new JSONObject().put("phase", "rows").put("zone", zone.getId())
+                .put("dates", new JSONArray()).put("datePicker", true).put("more", true).put("text", pageOne);
+
+        observe(capture, poll, view);
+        poll.pagination.clicked(android.os.SystemClock.elapsedRealtime());
+        observe(capture, poll, view.put("text", pageTwo));
+        shadowOf(Looper.getMainLooper()).idleFor(1300, TimeUnit.MILLISECONDS);
+        observe(capture, poll, view);
+        assertFalse(poll.result.isDone());
+        poll.pagination.clicked(android.os.SystemClock.elapsedRealtime());
+        observe(capture, poll, view.put("text", pageThree));
+        shadowOf(Looper.getMainLooper()).idleFor(900, TimeUnit.MILLISECONDS);
+        observe(capture, poll, view);
+        assertEquals(3, poll.pagination.pages());
+        assertFalse(poll.triedRange);
+        assertEquals(1, TradeReview.at(poll.result.join().rows, stamp).size());
+
+        var enoughForTwo = WebRecords.parse(pageThree.replace("10MU", "20MU"), day, day, zone);
+        assertTrue(TradeReview.checkCloseCopies(enoughForTwo, stamp, sample, true).isEmpty());
+        var openingSample = WebRecords.parse(opening + opening, day, day, zone);
+        assertEquals(1, TradeReview.checkOpeningCopies(openingSample).size());
+    }
+
+    @Test public void aSavedPageCopyAtTheArchiveTailCanBeSettledFromACleanerRetry() throws Exception {
+        String portfolio = "23324464";
+        LeaderArchive archive = LeaderArchive.open(RuntimeEnvironment.getApplication());
+        Rules.Signal open = signal(0, Rules.Action.OPEN_SHORT, "10");
+        Rules.Signal close = signal(1, Rules.Action.CLOSE_SHORT, "3");
+        Rules.Signal end = signal(2, Rules.Action.CLOSE_SHORT, "7");
+        archive.capture(portfolio, "", List.of(open, close), START, true, "原基线");
+        archive.queueReviews(portfolio, Map.of(close.time, List.of(close, close.withOccurrence(1))));
+        archive.observeGap(portfolio, "", List.of(close, close.withOccurrence(1), end), START + 1000);
+        LeaderArchive.State before = archive.state(portfolio);
+        List<Rules.Signal> clean = List.of(close, end);
+        long since = archive.reviewFromArchiveTail(portfolio, before, clean);
+        assertEquals(close.time, since);
+        List<Rules.Signal> verified = archive.reconcileArchiveCloses(portfolio, before, clean, since, null, false);
+        assertEquals(List.of(close.id, end.id), verified.stream().map(row -> row.id).toList());
+        assertNull(archive.nextReview(portfolio));
+        assertEquals(1L, archive.detectionCount(portfolio));
+        LeaderArchive.Update update = archive.capture(portfolio, "", verified, START + 2000, false,
+                "续接旧档案", true, 1, true);
+        assertTrue(update.continuous);
+        assertEquals(1, update.added);
+        assertFalse(update.state.estimate.containsKey("BTCUSDT|SHORT"));
+        assertEquals(3L, archive.count(portfolio));
+        assertEquals(1L, archive.detectionCount(portfolio));
+    }
+
+    @Test public void localCloseCountsCannotHideAnActualGapInTheArchiveOverlap() throws Exception {
+        String portfolio = "23324465";
+        LeaderArchive archive = LeaderArchive.open(RuntimeEnvironment.getApplication());
+        Rules.Signal first = signal(0, Rules.Action.OPEN_SHORT, "6");
+        Rules.Signal missing = signal(1, Rules.Action.OPEN_SHORT, "3");
+        Rules.Signal tail = signal(2, Rules.Action.OPEN_SHORT, "1");
+        Rules.Signal close = signal(3, Rules.Action.CLOSE_SHORT, "3");
+        Rules.Signal end = signal(4, Rules.Action.CLOSE_SHORT, "7");
+        LeaderArchive.State before = archive.capture(portfolio, "", List.of(first, missing, tail), START,
+                true, "原基线").state;
+        List<Rules.Signal> gap = List.of(first, tail, close, close.withOccurrence(1), end);
+        archive.queueReviews(portfolio, TradeReview.repeatedSeconds(gap));
+        assertSame(gap, archive.reconcileArchiveCloses(portfolio, before, gap, close.time, null, false));
+        assertNotNull(archive.nextReview(portfolio));
+        assertEquals(before.head, archive.state(portfolio).head);
+    }
+
+    @Test public void aCompleteDisjointSwitchUsesOnlyTheNewSegmentToCountCloses() throws Exception {
+        String portfolio = "23324466";
+        LeaderArchive archive = LeaderArchive.open(RuntimeEnvironment.getApplication());
+        Rules.Signal old = signal(0, Rules.Action.OPEN_SHORT, "100");
+        LeaderArchive.State before = archive.capture(portfolio, "", List.of(old), START, true, "原基线").state;
+        Rules.Signal open = signal(1, Rules.Action.OPEN_SHORT, "10");
+        Rules.Signal close = signal(2, Rules.Action.CLOSE_SHORT, "3");
+        Rules.Signal end = signal(3, Rules.Action.CLOSE_SHORT, "7");
+        List<Rules.Signal> raw = List.of(open, close, close.withOccurrence(1), end);
+        assertSame(raw, archive.reconcileArchiveCloses(portfolio, before, raw, open.time, null, false));
+        List<Rules.Signal> verified = archive.reconcileArchiveCloses(portfolio, before, raw, open.time, null, true);
+        assertEquals(List.of(open, close, end), verified);
+        LeaderArchive.Update saved = archive.capture(portfolio, "", verified, START + 4000, true, "新段已读完", true, 1);
+        assertTrue(saved.continuous);
+        assertTrue(saved.baseline);
+        assertEquals(4L, archive.count(portfolio));
+        assertTrue(saved.state.estimate.isEmpty());
+    }
+
+    @Test public void unprovenNewSwitchCopiesAreSavedForReviewWithoutBlockingTheArchive() throws Exception {
+        String portfolio = "23324467";
+        Application app = RuntimeEnvironment.getApplication();
+        LeaderArchive archive = LeaderArchive.open(app);
+        Rules.Signal open = signal(0, Rules.Action.OPEN_SHORT, "10");
+        LeaderArchive.State before = archive.capture(portfolio, "", List.of(open), START, true, "原基线").state;
+        archive.saveAccountFill(portfolio, AutoFollowService.DEMO_WEB, "held-switch-fill", START, "原有成交");
+        Rules.Signal close = signal(1, Rules.Action.CLOSE_SHORT, "2");
+        Rules.Signal same = close.withOccurrence(1);
+        Rules.Signal next = signal(2, Rules.Action.OPEN_LONG, "4");
+        List<Rules.Signal> raw = List.of(open, close, same, next);
+        archive.queueReviews(portfolio, TradeReview.repeatedSeconds(raw));
+
+        var controller = Robolectric.buildService(AutoFollowService.class).create();
+        try {
+            AutoFollowService service = controller.get();
+            ReflectionHelpers.setField(service, "initial", new Rules.Config(portfolio, new LocalData(app).config().rules));
+            // On the retry the website returns one copy, but the previous unresolved observation still exists.
+            WebsiteCapture.Read read = new WebsiteCapture.Read("", List.of(open, close, next), null, null,
+                    false, "", false, "", START);
+            WebsiteCapture.Read verified = ReflectionHelpers.callInstanceMethod(service, "verifyWebsiteRows",
+                    ClassParameter.from(LeaderArchive.State.class, before),
+                    ClassParameter.from(WebsiteCapture.Read.class, read), ClassParameter.from(boolean.class, true));
+            assertTrue(TradeReview.same(List.of(close), verified.provisional.get(close.time)));
+            LeaderArchive.Update saved = archive.capture(portfolio, "", verified.rows, START + 4000, false,
+                    "衔接旧档案", true, 1, true, verified.provisional);
+            assertTrue(saved.continuous);
+            assertEquals(2, saved.added);
+            assertEquals(1, archive.verifiedSelection(portfolio));
+            assertEquals(4, saved.state.head);
+            assertEquals(new BigDecimal("8"), saved.state.estimate.get("BTCUSDT|SHORT"));
+            assertEquals(new BigDecimal("4"), saved.state.estimate.get("BTCUSDT|LONG"));
+        } finally { controller.destroy(); }
+
+        archive.close();
+        assertEquals(3L, archive.count(portfolio));
+        assertEquals(1L, archive.accountFillCount(portfolio));
+        assertEquals(2L, archive.detectionCount(portfolio));
+        assertNull(archive.nextReview(portfolio));
+        List<LeaderArchive.Review> pending = archive.provisionalReviews(portfolio);
+        assertEquals(1, pending.size());
+        assertEquals(Set.of("BTCUSDT|SHORT"), TradeReview.repeatedLegs(pending.get(0).sample));
+        assertEquals(2, pending.get(0).sample.size());
+        assertTrue(archive.connectsToTail(portfolio, archive.state(portfolio), raw));
+        assertTrue(archive.resolveProvisionalReview(portfolio, pending.get(0), List.of(close, same), true));
+        assertEquals(4L, archive.count(portfolio));
+        assertEquals(2L, archive.detectionCount(portfolio));
+        assertEquals(new BigDecimal("6"), archive.state(portfolio).estimate.get("BTCUSDT|SHORT"));
+    }
+
     @Test public void resetsCachedInitialChoiceForANewTradingSessionButKeepsItForAnInterruptedSession() throws Exception {
         String portfolio = "23324462";
         Application app = RuntimeEnvironment.getApplication();

@@ -858,13 +858,28 @@ public final class AutoFollowService extends Service {
             }
         }
         long since = reviewFrom(read.rows, before, switched, joined);
+        if (!freshArchive && (switched || read.recovered || reconciliationPending
+                || (joined && !TradeReview.repeatedSeconds(read.rows).isEmpty()))) {
+            synchronized (TRADE_LOCK) {
+                if (stopped) throw WebsiteCapture.reviewFailure("本轮跟踪已停止");
+                read = read.withRows(archive.reconcileArchiveCloses(portfolio, before, read.rows, since,
+                        read.leaderMargin, switched && read.historyComplete && !joined));
+            }
+        }
+        Map<Long, List<Rules.Signal>> provisional = new LinkedHashMap<>();
+        if (switched && !freshArchive && before.latest() != null && (joined || read.historyComplete)) {
+            read = read.withRows(archive.retainPendingArchiveSamples(portfolio, before, read.rows, read.leaderMargin));
+            provisional.putAll(archive.stageableArchiveReviews(portfolio, before, read.rows,
+                    read.historyComplete && !joined));
+        }
+        if (before.historyComplete && !switched) recheckProvisional(portfolio);
         if (joined && since > read.rows.get(read.rows.size() - 1).time) {
             // All visible trades were already confirmed. Don't reopen the site to review them again.
             return read;
         }
-        reviewClosedPositions(portfolio, read.rows, read.historyComplete && !joined, since, !joined);
+        reviewClosedPositions(portfolio, read.rows, read.historyComplete && !joined, since, !joined && !switched,
+                provisional.keySet(), switched);
         read = read.withRows(archive.normalizeReviewedDuplicates(portfolio, read.rows, read.leaderMargin));
-        Map<Long, List<Rules.Signal>> provisional = new LinkedHashMap<>();
         if (freshArchive) {
             for (Map.Entry<Long, List<Rules.Signal>> group : TradeReview.repeatedSeconds(read.rows).entrySet()) {
                 boolean exactRepeat = TradeReview.counts(group.getValue()).size() < group.getValue().size();
@@ -876,38 +891,64 @@ public final class AutoFollowService extends Service {
                 }
             }
         } else {
-            if (before.historyComplete && !joined) recheckProvisional(portfolio);
-            read = read.withRows(archive.normalizeReviewedDuplicates(portfolio, read.rows, read.leaderMargin));
             read = read.withRows(archive.normalizeProvisional(portfolio, read.rows, read.leaderMargin));
+            WebsiteCapture.Read current = read;
+            provisional.keySet().removeIf(stamp -> !TradeReview.exactCopies(TradeReview.at(current.rows, stamp)));
         }
         since = reviewFrom(read.rows, before, switched, joined);
         Map<Long, List<Rules.Signal>> candidates = TradeReview.repeatedSeconds(read.rows);
-        candidates.keySet().removeAll(provisional.keySet());
         long reviewFrom = since;
-        candidates.keySet().removeIf(stamp -> stamp < reviewFrom);
+        candidates.entrySet().removeIf(entry -> {
+            long stamp = entry.getKey();
+            if (stamp < reviewFrom) return true;
+            if (!provisional.containsKey(stamp)) return false;
+            if (freshArchive) return true;
+            return source == null ? TradeReview.checkOpeningCopies(entry.getValue()).isEmpty()
+                    : !TradeReview.canReviewFromList(entry.getValue());
+        });
         archive.queueReviews(portfolio, candidates);
         long through = read.rows.get(read.rows.size() - 1).time;
         Set<Long> visible = new LinkedHashSet<>();
-        for (Rules.Signal row : read.rows) if (row.time >= since) visible.add(row.time);
+        for (Rules.Signal row : read.rows) {
+            if (row.time >= since && (!provisional.containsKey(row.time) || candidates.containsKey(row.time))) {
+                visible.add(row.time);
+            }
+        }
         LeaderArchive.Review review = archive.nextReview(portfolio, since, through, visible);
         Map<Long, List<Rules.Signal>> justChecked = new LinkedHashMap<>();
-        for (int checked = 0; review != null && checked < 2; checked++) {
-            initialPositions = null;
-            status("正在复核同秒成交 · " + TradeNotice.fullTime(review.stamp));
-            List<Rules.Signal> official = source.review(review.stamp);
-            if (freshArchive) official = TradeReview.baselineCounts(official).rows;
-            synchronized (TRADE_LOCK) {
-                if (stopped) throw WebsiteCapture.reviewFailure("本轮跟踪已停止");
-                if (archive.resolveReview(portfolio, review, official)) {
-                    lastVerifiedSnapshot = -1;
-                    initialSelection.set(null);
-                    changed();
+        int webReviews = 0;
+        while (review != null) {
+            List<Rules.Signal> official = TradeReview.checkOpeningCopies(review.sample);
+            boolean canDefer = provisional.containsKey(review.stamp);
+            if (official.isEmpty() && webReviews < 2) {
+                webReviews++;
+                initialPositions = null;
+                status("正在复核同秒成交 · " + TradeNotice.fullTime(review.stamp));
+                try {
+                    official = source.review(review);
+                    if (freshArchive) official = TradeReview.baselineCounts(official).rows;
+                } catch (WebsiteCapture.Failure unavailable) {
+                    if (!canDefer || unavailable.stop || unavailable.access != WebsiteCapture.Access.NONE
+                            || unavailable.backoffMs > 12000) throw unavailable;
                 }
             }
-            justChecked.put(review.stamp, official);
+            if (official.isEmpty()) {
+                if (!canDefer) throw WebsiteCapture.reviewFailure("还有其他成交等待独立读取");
+                visible.remove(review.stamp);
+            } else {
+                synchronized (TRADE_LOCK) {
+                    if (stopped) throw WebsiteCapture.reviewFailure("本轮跟踪已停止");
+                    if (archive.resolveReview(portfolio, review, official)) {
+                        lastVerifiedSnapshot = -1;
+                        initialSelection.set(null);
+                        changed();
+                    }
+                }
+                justChecked.put(review.stamp, official);
+                provisional.remove(review.stamp);
+            }
             review = archive.nextReview(portfolio, since, through, visible);
         }
-        if (review != null) throw WebsiteCapture.reviewFailure("还有其他成交等待独立读取");
         return read.withRows(archive.verifiedRows(portfolio, read.rows, read.leaderMargin, justChecked, since,
                 provisional.keySet())).withProvisional(provisional);
     }
@@ -931,7 +972,7 @@ public final class AutoFollowService extends Service {
         baselineReviewBefore = review.stamp;
         try {
             status("正在复核已建档成交 · " + TradeNotice.fullTime(review.stamp));
-            List<Rules.Signal> checked = source.review(review.stamp);
+            List<Rules.Signal> checked = source.review(review);
             synchronized (TRADE_LOCK) {
                 if (stopped) return;
                 if (archive.resolveBaselineReview(portfolio, review, checked)) {
@@ -956,7 +997,7 @@ public final class AutoFollowService extends Service {
             if (review.stamp >= provisionalBefore) continue;
             provisionalBefore = review.stamp;
             try {
-                List<Rules.Signal> checked = source.reviewProvisional(review.stamp);
+                List<Rules.Signal> checked = source.reviewProvisional(review);
                 synchronized (TRADE_LOCK) {
                     if (stopped) return;
                     if (archive.resolveProvisionalReview(portfolio, review, checked, false)) {
@@ -966,7 +1007,7 @@ public final class AutoFollowService extends Service {
                     }
                 }
             } catch (WebsiteCapture.Failure unavailable) {
-                // This optional read may be empty or stale even after the dates have changed.
+                // Leave this optional review pending until the website supplies enough evidence.
             }
             return;
         }
@@ -974,14 +1015,17 @@ public final class AutoFollowService extends Service {
     }
 
     private void reviewClosedPositions(String portfolio, List<Rules.Signal> rows, boolean fullHistory,
-            long reviewFrom, boolean scanArchived) throws Exception {
+            long reviewFrom, boolean scanArchived, Set<Long> deferred, boolean switchingArchive) throws Exception {
         long now = SystemClock.elapsedRealtime();
         if (now < nextPositionReview) return;
         boolean checkDirection = OneWayTrades.hasSideReports(rows) && (fullHistory
                 || !archive.resolveTradeSides(portfolio, archive.state(portfolio), rows, closedPositionHistory).pending.isEmpty());
         boolean visibleRepeats = false;
         for (Map.Entry<Long, List<Rules.Signal>> group : TradeReview.repeatedSeconds(rows).entrySet()) {
-            if (group.getKey() >= reviewFrom && !archive.hasCheckedReview(portfolio, group.getKey(), group.getValue())) {
+            if (group.getKey() >= reviewFrom && !deferred.contains(group.getKey())
+                    && !(switchingArchive && TradeReview.canReviewFromList(group.getValue()))
+                    && TradeReview.checkOpeningCopies(group.getValue()).isEmpty()
+                    && !archive.hasCheckedReview(portfolio, group.getKey(), group.getValue())) {
                 visibleRepeats = true;
                 break;
             }
